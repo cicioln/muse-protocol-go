@@ -164,11 +164,17 @@ func (e *ProtoEngine) proxyFor(acc *Account) string {
 	return route
 }
 
+// wsProxy resolves the route for the gateway itself, so NO_PROXY and
+// HTTPS_PROXY rules that name the gateway host apply to the WebSocket.
 func (e *ProtoEngine) wsProxy(acc *Account) string {
-	route, err := netproxy.Resolve(e.proxyFor(acc), e.cfg.SiteURL)
+	setting := netproxy.Effective(acc.Proxy, e.cfg.Proxy)
+	route, err := netproxy.Resolve(setting, e.cfg.GatewayURL)
 	if err != nil {
-		return e.proxyFor(acc)
-	} // the dialer fails closed on invalid configuration
+		if setting == "" {
+			return "invalid://proxy"
+		}
+		return setting // the dialer fails closed on invalid configuration
+	}
 	return route
 }
 
@@ -1264,6 +1270,30 @@ func classifyTurnErr(text string) error {
 	return nil
 }
 
+// Chat replies are ordinary model text, so a keyword anywhere in a short
+// answer ("what is an API rate limit?") must not turn it into an error. Only
+// a brief reply that starts like an upstream limit notice is classified.
+var (
+	chatRateNoticeRe  = regexp.MustCompile(`(?i)^[\s\p{P}\p{S}]*(you('ve| have| are)? (been )?(rate[- ]limited|sending (requests )?too (fast|quickly))|too many requests|rate limit(ed)? (exceeded|reached|hit)|请求过于频繁|触发频率限制)`)
+	chatQuotaNoticeRe = regexp.MustCompile(`(?i)^[\s\p{P}\p{S}]*(you('ve| have)? (run out of|used up|used all( of)? your|reached your|hit your) (credits|usage|messages|daily|weekly|monthly|limit)|out of credits|(daily |weekly |monthly )?usage limit reached|(daily |weekly |monthly )?limit reached|额度不足|积分不足|用量已达|今日额度)`)
+)
+
+const chatNoticeMaxRunes = 200
+
+func classifyChatNotice(text string) error {
+	text = strings.TrimSpace(text)
+	if text == "" || len([]rune(text)) > chatNoticeMaxRunes {
+		return nil
+	}
+	if chatRateNoticeRe.MatchString(text) {
+		return errf(KindRateLimit, "上游限流")
+	}
+	if chatQuotaNoticeRe.MatchString(text) {
+		return errf(KindQuota, "账号额度不足")
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------- Backend
 
 func (e *ProtoEngine) Chat(ctx context.Context, acc *Account, prompt string, refs []RefImage, onDelta func(string)) (*ChatResult, error) {
@@ -1285,7 +1315,7 @@ func (e *ProtoEngine) Chat(ctx context.Context, acc *Account, prompt string, ref
 	if turn.text == "" {
 		return nil, errf(KindTransient, "muse 返回了空回复")
 	}
-	if err := classifyTurnErr(turn.text); err != nil {
+	if err := classifyChatNotice(turn.text); err != nil {
 		return nil, err
 	}
 	res := &ChatResult{Text: turn.text}
