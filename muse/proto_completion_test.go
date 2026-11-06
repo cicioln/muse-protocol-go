@@ -26,12 +26,15 @@ func TestMediaTextOnlyCompletionRequiresTerminalAndQuiet(t *testing.T) {
 		{"tool running after completed message", "I cannot generate that video yet", true, false, true, false, time.Hour, false},
 		{"recent stream or tool activity", "I cannot generate that video", true, false, false, false, 0, false},
 		{"completed tools and explicit refusal", "I cannot generate that video", true, false, false, false, time.Minute, true},
-		{"completed question", "Which scene should I use?", true, false, false, false, time.Minute, true},
+		{"completed question", "Which scene should I use?", true, false, false, false, 3 * time.Minute, true},
 		{"working message completion is not turn completion", "Generating video", true, false, false, false, time.Hour, false},
 		{"explicit turn completion", "Generating video", true, false, false, true, time.Minute, true},
+		{"acknowledgement before video", "Got it — animating the orange cat for 5 seconds.", true, false, false, false, time.Hour, false},
+		{"video answer still in grace", "Here is your clip", true, false, false, false, time.Minute, false},
+		{"video answer after grace", "Here is your clip", true, false, false, false, 3 * time.Minute, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := mediaTextOnlySettled(tc.text, tc.done, tc.assistantActive, tc.toolActive, tc.ended, tc.quiet); got != tc.want {
+			if got := mediaTextOnlySettled(tc.text, "video", tc.done, tc.assistantActive, tc.toolActive, tc.ended, tc.quiet); got != tc.want {
 				t.Fatalf("settled=%v want=%v", got, tc.want)
 			}
 		})

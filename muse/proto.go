@@ -414,6 +414,9 @@ var (
 	textSettle   = 2 * time.Second
 	mediaSettle  = 25 * time.Second
 	pollInterval = 300 * time.Millisecond
+	// Quiet time before a finished non-progress reply ends a media turn.
+	imageTextOnlyGrace = 15 * time.Second
+	videoTextOnlyGrace = 2 * time.Minute
 	// While the chat stream is open and quiet, nothing new is expected in the
 	// history; a stream record wakes the poller early.
 	streamQuietPoll = 1500 * time.Millisecond
@@ -639,7 +642,7 @@ func (e *ProtoEngine) followThread(ctx context.Context, conn *hatch.Conn, sessio
 					quietSince = lastStream
 				}
 			}
-			if len(res.media) == 0 && mediaTextOnlySettled(cur, done, inProgress, historyInProgress, turnCompleted, time.Since(quietSince)) {
+			if len(res.media) == 0 && mediaTextOnlySettled(cur, want, done, inProgress, historyInProgress, turnCompleted, time.Since(quietSince)) {
 				return res, nil
 			}
 			key := ""
@@ -662,7 +665,7 @@ func (e *ProtoEngine) followThread(ctx context.Context, conn *hatch.Conn, sessio
 // Text silence is not a terminal signal for media generation. In particular,
 // video tools can run for minutes without changing the assistant's progress
 // text. Unknown or active turns remain bounded by the caller's deadline.
-func mediaTextOnlySettled(text string, done, assistantActive, historyActive, turnCompleted bool, quietFor time.Duration) bool {
+func mediaTextOnlySettled(text, want string, done, assistantActive, historyActive, turnCompleted bool, quietFor time.Duration) bool {
 	if text == "" || !done || assistantActive || historyActive || quietFor < textSettle {
 		return false
 	}
@@ -671,7 +674,17 @@ func mediaTextOnlySettled(text string, done, assistantActive, historyActive, tur
 	}
 	// A completed question/non-progress answer gets a grace period for tool
 	// events or presentations to arrive; any history or stream update resets it.
-	return !isWorking(text) && quietFor > 15*time.Second
+	return !isWorking(text) && quietFor > textOnlyGrace(want)
+}
+
+// textOnlyGrace is how long a finished, non-progress reply must stay quiet
+// before it counts as the whole answer. A video tool can render for minutes
+// after a short acknowledgement without touching the history.
+func textOnlyGrace(want string) time.Duration {
+	if want == "video" {
+		return videoTextOnlyGrace
+	}
+	return imageTextOnlyGrace
 }
 
 // Inspect explicit lifecycle fields rather than guessing tool names or URLs.
@@ -760,7 +773,9 @@ func eventsFingerprint(evs []map[string]any) string {
 
 var (
 	refusalMarkersRe = regexp.MustCompile(`(?i)(could ?n.?t|can.?t|cannot|unable to|not able to|won.?t|will not|fail(ed)? to)\s+(generate|create|make|depict|fulfill)|content policy|safety (policy|guidelines)|community (standards|guidelines)|real (people|individuals)|not available (for your account|in your)|country or region|out of credits|limit reached|tool is (currently )?unavailable|无法生成|生成失败|没生成成|未生成成功|不支持`)
-	workingRe        = regexp.MustCompile(`(?i)search|looking|checking|finding|generating|creating|drawing|rendering|wait|working on|正在|生成中`)
+	// Progress and acknowledgement replies ("Got it — animating the cat")
+	// precede the media; they are not the final answer.
+	workingRe = regexp.MustCompile(`(?i)search|looking|checking|finding|generating|creating|drawing|rendering|animating|producing|preparing|processing|composing|wait|working on|got it|on it|one moment|just a (moment|sec)|hang tight|coming (right )?up|正在|生成中|制作中|处理中|稍等|请稍候|马上|这就`)
 )
 
 func assistantFinished(p map[string]any) bool {
