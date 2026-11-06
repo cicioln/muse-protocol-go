@@ -1358,6 +1358,11 @@ func (e *ProtoEngine) Generate(ctx context.Context, acc *Account, r GenRequest) 
 		return nil, err
 	}
 	if len(turn.media) == 0 {
+		// A failed media tool call names the real cause; the assistant's
+		// text afterwards usually only paraphrases it.
+		if f := findToolFailure(turn.events); f != nil {
+			return nil, f.error(r.Kind)
+		}
 		if err := classifyTurnErr(turn.text); err != nil {
 			return nil, err
 		}
