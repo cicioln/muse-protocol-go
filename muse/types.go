@@ -74,7 +74,7 @@ type Account struct {
 }
 
 const (
-	MaxRefImages     = 4
+	MaxRefImages     = 10
 	MaxRefImageBytes = 10 << 20
 	MaxRefTotalBytes = 24 << 20
 )
