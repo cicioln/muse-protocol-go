@@ -23,6 +23,7 @@ type Config struct {
 	ChatTimeout     time.Duration
 	GenerateTimeout time.Duration
 	IdleClose       time.Duration
+	FFmpegPath      string // used by GenerateLongVideo; empty looks up "ffmpeg" on PATH
 }
 
 func (c Config) withDefaults() Config {

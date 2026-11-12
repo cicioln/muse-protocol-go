@@ -207,6 +207,25 @@ for _, file := range files {
 
 返回的 `Media` 包含 `Filename`、`Mime`、`Bytes`，以及可识别的 `Width`、`Height`、`Seconds`。`N` 限制最多返回的文件数；请求多张时需在 prompt 表达数量，并检查实际 `len(files)`。
 
+### 4. 长视频（超过 10 秒）
+
+Muse 单次最多生成 10 秒视频。`GenerateLongVideo` 把总时长平均拆成每段不超过 10 秒（`SplitVideoSeconds(25, 10)` 为 `[9 8 8]`），逐段生成；第二段起把上一段的末帧传给 `Segment` 回调，由调用方放进该段的参考图和 prompt。各段截到计划时长、统一分辨率后用 ffmpeg 拼成一个 H.264/AAC MP4，分段文件随后删除。需要本机有 ffmpeg（`Config.FFmpegPath`，默认在 PATH 中查找）。
+
+```go
+video, err := client.GenerateLongVideo(ctx, account, muse.LongVideoRequest{
+    Seconds: 30,
+    Segment: func(s muse.VideoSegment) (string, []muse.RefImage) {
+        prompt := fmt.Sprintf("Use your video generation tool. Part %d of %d, %d seconds. ...", s.Index+1, s.Count, s.Seconds)
+        if s.LastFrame != nil {
+            return prompt + "\nStart from the attached frame.", []muse.RefImage{*s.LastFrame}
+        }
+        return prompt, nil
+    },
+})
+```
+
+第一段之后的失败会包装成 `NoRetry`，因为前面的分段已经消耗了账号额度。
+
 ## 面向服务集成
 
 | 关注点 | 接入方式 |
