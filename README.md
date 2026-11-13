@@ -209,7 +209,19 @@ for _, file := range files {
 
 ### 4. 长视频（超过 10 秒）
 
-Muse 单次最多生成 10 秒视频。`GenerateLongVideo` 把总时长平均拆成每段不超过 10 秒（`SplitVideoSeconds(25, 10)` 为 `[9 8 8]`），逐段生成；第二段起把上一段的末帧传给 `Segment` 回调，由调用方放进该段的参考图和 prompt。各段截到计划时长、统一分辨率后用 ffmpeg 拼成一个 H.264/AAC MP4，分段文件随后删除。需要本机有 ffmpeg（`Config.FFmpegPath`，默认在 PATH 中查找）。
+Muse 单次最多生成 10 秒视频。`GenerateLongVideo` 把总时长平均拆成每段不超过 10 秒（`SplitVideoSeconds(25, 10)` 为 `[9 8 8]`），逐段生成；第二段起把上一段的末帧传给 `Segment` 回调，由调用方放进该段的参考图和 prompt。各段截到计划时长、统一分辨率后拼成一个 H.264/AAC MP4，分段文件随后删除。
+
+拼接位置由 `LongVideoRequest.Join` 决定：
+
+| 取值 | 行为 |
+| --- | --- |
+| `JoinAuto`（默认） | 先发一轮对话，让账号 VM 用自己的 ffmpeg 拼接（各段就生成在这台 VM 上），再下载结果。VM 返回的视频时长或尺寸不对、命令失败或超时，就改用本机 ffmpeg。 |
+| `JoinVM` | 只在 VM 上拼接，失败即报错。 |
+| `JoinLocal` | 只用本机 ffmpeg。 |
+
+VM 拼接这一轮的审批策略是 `allow`，因为代理需要执行 shell。prompt 只包含 SDK 生成的固定命令和文件路径，不含用户文本。`OnJoin` 回调报告实际拼接位置，以及回退时 VM 的失败原因。
+
+本机始终需要 ffmpeg（`Config.FFmpegPath`，默认在 PATH 中查找），因为取末帧在本机完成。本机拼接以 `nice -n 15` 运行，整个 client 同时最多 `Config.FFmpegConcurrency` 个（默认 1），其余排队。
 
 ```go
 video, err := client.GenerateLongVideo(ctx, account, muse.LongVideoRequest{

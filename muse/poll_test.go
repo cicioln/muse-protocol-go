@@ -72,7 +72,7 @@ func TestHistoryCacheDoesNotReturnStaleAnswerAfterAnchorDisappears(t *testing.T)
 	defer func() { textSettle, pollInterval = oldSettle, oldPoll }()
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	got, err := e.followThread(ctx, lease.conn, "history-window", "anchor", "review prompt", "", nil, nil, nil)
+	got, err := e.followThread(ctx, lease.conn, "history-window", "anchor", "review prompt", "", "", nil, nil, nil)
 	if got != nil || err == nil {
 		t.Fatalf("stale history returned success: result=%+v err=%v", got, err)
 	}

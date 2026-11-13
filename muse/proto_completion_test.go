@@ -196,7 +196,7 @@ func TestFollowMediaWaitsForToolThenCollectsLateVideo(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), budget)
 			defer cancel()
-			got, err := e.followThread(ctx, lease.conn, "media-completion", "anchor", "create video", "video", nil, nil, nil)
+			got, err := e.followThread(ctx, lease.conn, "media-completion", "anchor", "create video", "video", "", nil, nil, nil)
 			if wantTimeout {
 				if got != nil || err == nil || !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 					t.Fatalf("active media must wait for deadline: result=%+v err=%v context=%v", got, err, ctx.Err())

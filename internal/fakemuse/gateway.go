@@ -27,9 +27,23 @@ type Gateway struct {
 	Decisions []string // approval decisions received
 	// Optional immutable test hook; configure before serving any requests.
 	HistoryResponse func(sessionID string) ([]byte, bool)
+	// Files are extra workspace files served from /media/raw/<path>, keyed
+	// by path without a leading slash. Guarded by mu.
+	Files map[string][]byte
+	// Video, when set, answers a "generate video" turn with a new file in
+	// Files: it returns the file's content. Configure before serving.
+	Video func(n int) []byte
+	// Join, when set, answers a turn asking to join videos: it receives the
+	// prompt and returns the joined file's path and content, or an error text
+	// for the assistant to reply with. Configure before serving.
+	Join func(prompt string, files map[string][]byte) (path string, data []byte, failure string)
+
+	videos int // videos generated so far; guarded by mu
 }
 
-func NewGateway() *Gateway { return &Gateway{threads: map[string][]map[string]any{}} }
+func NewGateway() *Gateway {
+	return &Gateway{threads: map[string][]map[string]any{}, Files: map[string][]byte{}}
+}
 
 // ---- server-side websocket (just enough for tests)
 
@@ -222,7 +236,16 @@ func (s *session) route(svc hatch.Service, id int64, req *hatch.AppRequest) {
 		s.reply(id, 200, b, true)
 	case req.Verb == "GET" && strings.HasPrefix(u.Path, "/media/raw/"):
 		if u.Path != "/media/raw/workspace/out/cat.png" {
-			s.reply(id, 404, nil, true)
+			g.mu.Lock()
+			data, ok := g.Files[strings.TrimPrefix(u.Path, "/media/raw/")]
+			g.mu.Unlock()
+			if !ok {
+				s.reply(id, 404, nil, true)
+				return
+			}
+			head := min(len(data), 10)
+			s.reply(id, 200, data[:head], false, hatch.Header{Key: "content-type", Value: "video/mp4"})
+			s.send(&hatch.Frame{StreamID: id, IsChunk: true, Chunk: data[head:], ChunkEnd: true})
 			return
 		}
 		png := PNG()
@@ -233,7 +256,8 @@ func (s *session) route(svc hatch.Service, id int64, req *hatch.AppRequest) {
 		g.mu.Lock()
 		list := []map[string]any{}
 		for sid, evs := range g.threads {
-			if strings.Contains(fmt.Sprint(evs[0]["text"]), "fetch the web") && !g.decided(sid) {
+			text := fmt.Sprint(evs[0]["text"])
+			if (strings.Contains(text, "fetch the web") || g.Join != nil && strings.Contains(text, "join video files")) && !g.decided(sid) {
 				list = append(list, map[string]any{"approval_id": "ap-" + sid, "status": "pending",
 					"scope":            map[string]any{"thread_id": sid},
 					"decision_options": []any{map[string]any{"kind": "allow_once"}, map[string]any{"kind": "deny"}}})
@@ -294,6 +318,63 @@ func (g *Gateway) simulate(sid, msg string, refs int) {
 		g.mu.Unlock()
 	}
 	time.Sleep(100 * time.Millisecond)
+	if g.Join != nil && strings.Contains(msg, "join video files") {
+		// Like the real agent: the shell runs only after the permission
+		// prompt is answered with an allow decision.
+		approved := false
+		for !approved {
+			g.mu.Lock()
+			for _, d := range g.Decisions {
+				if strings.HasPrefix(d, sid+"=") {
+					approved = strings.HasPrefix(strings.TrimPrefix(d, sid+"="), "allow")
+					if !approved {
+						g.mu.Unlock()
+						add(map[string]any{"event_name": "message.assistant", "message_id": "a-" + sid, "payload": map[string]any{"text": "Permission denied.", "status": "completed"}})
+						add(map[string]any{"event_name": "turn.completed"})
+						return
+					}
+				}
+			}
+			g.mu.Unlock()
+			time.Sleep(50 * time.Millisecond)
+		}
+		g.mu.Lock()
+		files := map[string][]byte{}
+		for k, v := range g.Files {
+			files[k] = v
+		}
+		g.mu.Unlock()
+		path, data, failure := g.Join(msg, files)
+		if failure != "" {
+			add(map[string]any{"event_name": "message.assistant", "message_id": "a-" + sid, "payload": map[string]any{"text": failure, "status": "completed"}})
+			add(map[string]any{"event_name": "turn.completed"})
+			return
+		}
+		g.mu.Lock()
+		g.Files[path] = data
+		g.mu.Unlock()
+		add(map[string]any{"event_name": "message.assistant", "message_id": "a-" + sid, "payload": map[string]any{"text": "sandbox://" + path, "status": "completed"}})
+		add(map[string]any{"event_name": "turn.completed"})
+		return
+	}
+	if g.Video != nil && strings.Contains(msg, "video generation tool") {
+		g.mu.Lock()
+		g.videos++
+		n := g.videos
+		g.mu.Unlock()
+		data := g.Video(n)
+		path := fmt.Sprintf("workspace/out/clip-%d.mp4", n)
+		g.mu.Lock()
+		g.Files[path] = data
+		g.mu.Unlock()
+		add(map[string]any{"event_name": "message.assistant", "message_id": "a-" + sid, "payload": map[string]any{"text": "Generating…"}})
+		time.Sleep(200 * time.Millisecond)
+		add(map[string]any{"event_name": "delta.presentation", "payload": map[string]any{"kind": "video",
+			"videos": []any{map[string]any{"path": "sandbox://" + path, "mime": "video/mp4"}}}})
+		setText("Here is your video.", true)
+		add(map[string]any{"event_name": "turn.completed"})
+		return
+	}
 	if strings.Contains(msg, "draw") {
 		add(map[string]any{"event_name": "message.assistant", "message_id": "a-" + sid, "payload": map[string]any{"text": "Generating…"}})
 		time.Sleep(300 * time.Millisecond)

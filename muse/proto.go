@@ -38,6 +38,8 @@ type ProtoEngine struct {
 
 	onCookies func(string, map[string]string, map[string]int64)
 	onSession func(string, *SessionInfo)
+
+	ffmpegGate chan struct{} // caps local ffmpeg processes
 }
 
 type protoAcct struct {
@@ -74,7 +76,7 @@ func NewProtoEngine(cfg *Config, log *slog.Logger) *ProtoEngine {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &ProtoEngine{cfg: &c, log: log, accts: map[string]*protoAcct{}}
+	return &ProtoEngine{cfg: &c, log: log, accts: map[string]*protoAcct{}, ffmpegGate: make(chan struct{}, c.FFmpegConcurrency)}
 }
 
 func (e *ProtoEngine) SetHooks(onCookies func(string, map[string]string, map[string]int64), onSession func(string, *SessionInfo)) {
@@ -356,7 +358,8 @@ func imageItem(r RefImage, i int) map[string]any {
 
 // runTurn sends one message in a fresh side thread and follows the reply via
 // /chat/history until it settles.
-func (e *ProtoEngine) runTurn(ctx context.Context, a *protoLease, prompt string, refs []RefImage, want string, onDelta func(string), progress func(int)) (*turnResult, error) {
+// approval overrides Config.ApprovalPolicy for this turn when not empty.
+func (e *ProtoEngine) runTurn(ctx context.Context, a *protoLease, prompt string, refs []RefImage, want, approval string, onDelta func(string), progress func(int)) (*turnResult, error) {
 	conn := a.conn
 	var items []map[string]any
 	for i, r := range refs {
@@ -403,7 +406,7 @@ func (e *ProtoEngine) runTurn(ctx context.Context, a *protoLease, prompt string,
 			sig.record()
 		}
 	}()
-	result, err := e.followThread(ctx, conn, sessionID, messageID, prompt, want, onDelta, progress, sig)
+	result, err := e.followThread(ctx, conn, sessionID, messageID, prompt, want, approval, onDelta, progress, sig)
 	if err != nil {
 		return nil, &NoRetry{Err: err}
 	}
@@ -481,7 +484,10 @@ func waitPoll(ctx context.Context, d time.Duration, polledAt time.Time, s *strea
 	}
 }
 
-func (e *ProtoEngine) followThread(ctx context.Context, conn *hatch.Conn, sessionID, messageID, prompt, want string, onDelta func(string), progress func(int), sig *streamSignal) (*turnResult, error) {
+func (e *ProtoEngine) followThread(ctx context.Context, conn *hatch.Conn, sessionID, messageID, prompt, want, approval string, onDelta func(string), progress func(int), sig *streamSignal) (*turnResult, error) {
+	if approval == "" {
+		approval = e.cfg.ApprovalPolicy
+	}
 	if progress == nil {
 		progress = func(int) {}
 	}
@@ -512,9 +518,9 @@ func (e *ProtoEngine) followThread(ctx context.Context, conn *hatch.Conn, sessio
 		if err := ctx.Err(); err != nil {
 			return nil, wrap(KindTransient, "等待回复中断", err)
 		}
-		if e.cfg.ApprovalPolicy != "off" && time.Now().After(nextApproval) {
+		if approval != "off" && time.Now().After(nextApproval) {
 			nextApproval = time.Now().Add(4 * time.Second)
-			e.handleApprovals(ctx, conn, sessionID)
+			e.handleApprovals(ctx, conn, sessionID, approval)
 		}
 		polledAt = time.Now()
 		hctx, cancel := context.WithTimeout(ctx, 20*time.Second)
@@ -1004,7 +1010,7 @@ func normPath(p string) string {
 }
 
 // handleApprovals answers permission prompts of this thread according to policy.
-func (e *ProtoEngine) handleApprovals(ctx context.Context, conn *hatch.Conn, sessionID string) {
+func (e *ProtoEngine) handleApprovals(ctx context.Context, conn *hatch.Conn, sessionID, policy string) {
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	resp, err := conn.Do(cctx, hatch.Request{Method: http.MethodGet, Path: "/approvals", Service: hatch.ServiceSentinel})
@@ -1044,7 +1050,7 @@ func (e *ProtoEngine) handleApprovals(ctx context.Context, conn *hatch.Conn, ses
 		if id == "" {
 			id = str(rec, "id")
 		}
-		decision := pickDecision(rec, e.cfg.ApprovalPolicy)
+		decision := pickDecision(rec, policy)
 		if id == "" || decision == "" {
 			continue
 		}
@@ -1267,7 +1273,7 @@ func describeMedia(f io.ReaderAt, size int64, mime string, m mediaRef) *Media {
 		mime = map[string]string{".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif", ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime"}[ext]
 	}
 	w, h, secs := probeMediaFile(f, size)
-	return &Media{Filename: randHex(16) + ext, Kind: kind, Mime: mime, Bytes: size, Width: w, Height: h, Seconds: secs}
+	return &Media{Filename: randHex(16) + ext, Kind: kind, Mime: mime, Bytes: size, Width: w, Height: h, Seconds: secs, Source: m.Path}
 }
 
 func classifyTurnErr(text string) error {
@@ -1322,7 +1328,7 @@ func (e *ProtoEngine) Chat(ctx context.Context, acc *Account, prompt string, ref
 	defer e.release(acc.ID, a)
 	ctx, cancel := context.WithTimeout(ctx, e.cfg.ChatTimeout)
 	defer cancel()
-	turn, err := e.runTurn(ctx, a, prompt, refs, "", onDelta, nil)
+	turn, err := e.runTurn(ctx, a, prompt, refs, "", "", onDelta, nil)
 	e.persist(acc.ID, a.protoAcct, nil)
 	if err != nil {
 		return nil, err
@@ -1367,7 +1373,7 @@ func (e *ProtoEngine) Generate(ctx context.Context, acc *Account, r GenRequest) 
 	progress(10)
 	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
-	turn, err := e.runTurn(ctx, a, r.Prompt, r.Refs, r.Kind, nil, progress)
+	turn, err := e.runTurn(ctx, a, r.Prompt, r.Refs, r.Kind, "", nil, progress)
 	e.persist(acc.ID, a.protoAcct, nil)
 	if err != nil {
 		return nil, err

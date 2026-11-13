@@ -24,6 +24,9 @@ type Config struct {
 	GenerateTimeout time.Duration
 	IdleClose       time.Duration
 	FFmpegPath      string // used by GenerateLongVideo; empty looks up "ffmpeg" on PATH
+	// FFmpegConcurrency caps local ffmpeg processes across the client.
+	// Defaults to 1.
+	FFmpegConcurrency int
 }
 
 func (c Config) withDefaults() Config {
@@ -51,6 +54,9 @@ func (c Config) withDefaults() Config {
 	}
 	if c.IdleClose <= 0 {
 		c.IdleClose = 10 * time.Minute
+	}
+	if c.FFmpegConcurrency <= 0 {
+		c.FFmpegConcurrency = 1
 	}
 	return c
 }
@@ -107,6 +113,9 @@ type Media struct {
 	Width    int     `json:"width,omitempty"`
 	Height   int     `json:"height,omitempty"`
 	Seconds  float64 `json:"seconds,omitempty"`
+	// Source is the file's path in the account's VM workspace, when the
+	// file was downloaded from there.
+	Source string `json:"source,omitempty"`
 }
 
 type ChatResult struct {
