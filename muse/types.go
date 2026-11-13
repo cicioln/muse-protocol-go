@@ -83,7 +83,7 @@ type Account struct {
 const (
 	MaxRefImages     = 10
 	MaxRefImageBytes = 10 << 20
-	MaxRefTotalBytes = 24 << 20
+	MaxRefTotalBytes = MaxRefImages * MaxRefImageBytes
 )
 
 type RefImage struct {

@@ -25,6 +25,13 @@ func TestClientRejectsInvalidInputsBeforeConnecting(t *testing.T) {
 	if _, err := client.Chat(context.Background(), account, "hello", []RefImage{{Data: []byte("x"), Mime: "text/plain"}}, nil); KindOf(err) != KindBadRequest {
 		t.Fatalf("invalid image: %v", err)
 	}
+	tenMaxImages := make([]RefImage, MaxRefImages)
+	for i := range tenMaxImages {
+		tenMaxImages[i] = RefImage{Data: make([]byte, MaxRefImageBytes), Mime: "image/png"}
+	}
+	if err := validateRequest("hello", tenMaxImages); err != nil {
+		t.Fatalf("10x10MiB reference images rejected: %v", err)
+	}
 }
 
 func TestInvalidEndpointsFailBeforeRequestConstruction(t *testing.T) {

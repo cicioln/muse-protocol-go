@@ -32,8 +32,8 @@ const (
 const (
 	maxChunkPayload  = 4 << 20
 	sendChunkPayload = 48 << 10
-	maxChunks        = 256
-	maxAssembly      = 64 << 20
+	maxChunks        = 4096
+	maxAssembly      = 256 << 20
 )
 
 // ---- minimal protobuf encoding

@@ -203,7 +203,7 @@ for _, file := range files {
 }
 ```
 
-参考图通过 `[]muse.RefImage{{Data: imageBytes, Mime: "image/png"}}` 提供：对话使用 `Chat` 的 `refs` 参数，生成使用 `GenRequest.Refs`。支持最多 10 张参考图，单张不超过 10 MiB，总计不超过 24 MiB。
+参考图通过 `[]muse.RefImage{{Data: imageBytes, Mime: "image/png"}}` 提供：对话使用 `Chat` 的 `refs` 参数，生成使用 `GenRequest.Refs`。支持最多 10 张参考图，单张不超过 10 MiB，总计不超过 100 MiB。
 
 返回的 `Media` 包含 `Filename`、`Mime`、`Bytes`，以及可识别的 `Width`、`Height`、`Seconds`。`N` 限制最多返回的文件数；请求多张时需在 prompt 表达数量，并检查实际 `len(files)`。
 
