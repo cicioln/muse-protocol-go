@@ -144,16 +144,25 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 	start := 0
 	for i, seconds := range plan {
 		prompt, refs := r.Segment(VideoSegment{Index: i, Count: len(plan), Start: start, Seconds: seconds, LastFrame: frame})
-		files, err := e.Generate(ctx, acc, GenRequest{
-			Prompt:  prompt,
-			Kind:    "video",
-			Refs:    refs,
-			N:       1,
-			Timeout: r.Timeout,
-			OnProgress: func(p int) {
-				progress((i*100 + p) * 90 / (len(plan) * 100))
-			},
-		})
+		var files []Media
+		for attempt := 0; attempt < 2; attempt++ {
+			if attempt > 0 && sleep(ctx, 2*time.Second) != nil {
+				break
+			}
+			files, err = e.Generate(ctx, acc, GenRequest{
+				Prompt:  prompt,
+				Kind:    "video",
+				Refs:    refs,
+				N:       1,
+				Timeout: r.Timeout,
+				OnProgress: func(p int) {
+					progress((i*100 + p) * 90 / (len(plan) * 100))
+				},
+			})
+			if err == nil || !Retryable(err) || KindOf(err) != KindTransient {
+				break
+			}
+		}
 		if err == nil && len(files) == 0 {
 			err = errf(KindTransient, "muse returned no video")
 		}

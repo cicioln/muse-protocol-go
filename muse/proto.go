@@ -538,6 +538,13 @@ func (e *ProtoEngine) followThread(ctx context.Context, conn *hatch.Conn, sessio
 			_ = sleep(ctx, time.Second)
 			continue
 		}
+		if resp.Status >= 500 {
+			if consecutiveErr++; consecutiveErr > 12 {
+				return nil, classifyHTTPError("/chat/history", resp.Status, string(resp.Body), resp.Headers)
+			}
+			_ = sleep(ctx, backoff(time.Second, time.Duration(consecutiveErr)*2*time.Second))
+			continue
+		}
 		if resp.Status >= 400 {
 			return nil, classifyHTTPError("/chat/history", resp.Status, string(resp.Body), resp.Headers)
 		}
@@ -665,7 +672,16 @@ func (e *ProtoEngine) followThread(ctx context.Context, conn *hatch.Conn, sessio
 				}
 			}
 		}
-		waitPoll(ctx, pollDelay(time.Since(lastActivity), sig), polledAt, sig)
+		delay := pollDelay(time.Since(lastActivity), sig)
+		if want == "video" && pollInterval >= 300*time.Millisecond {
+			delay = max(delay, time.Second)
+		}
+		waitPoll(ctx, delay, polledAt, sig)
+		if want == "video" && pollInterval >= 300*time.Millisecond {
+			if gap := time.Second - time.Since(polledAt); gap > 0 {
+				_ = sleep(ctx, gap)
+			}
+		}
 	}
 }
 

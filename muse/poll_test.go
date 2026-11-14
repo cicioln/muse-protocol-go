@@ -87,3 +87,39 @@ func TestHistoryCacheDoesNotReturnStaleAnswerAfterAnchorDisappears(t *testing.T)
 		t.Fatal("test did not receive repeated unchanged history")
 	}
 }
+
+func TestFollowThreadRetriesTransient5xxFromHistory(t *testing.T) {
+	site, gateway := fakemuse.NewWithGateway()
+	defer site.Close()
+	var polls atomic.Int32
+	gateway.HistoryStatus = func(sessionID string) int {
+		if sessionID == "retry-502" && polls.Add(1) <= 3 {
+			return 502
+		}
+		return 200
+	}
+	gateway.HistoryResponse = func(sessionID string) ([]byte, bool) {
+		if sessionID != "retry-502" {
+			return nil, false
+		}
+		return []byte(`{"chat_events":[{"event_name":"message.user","message_id":"anchor","text":"hello"},{"event_name":"message.assistant","payload":{"text":"recovered after 502","status":"completed"}}]}`), true
+	}
+	e, acc := newTestProto(t, site.URL, "ws"+strings.TrimPrefix(site.URL, "http")+"/v1/noise")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	lease, err := e.acquire(ctx, acc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.release(acc.ID, lease)
+	oldSettle, oldPoll := textSettle, pollInterval
+	textSettle, pollInterval = 10*time.Millisecond, 5*time.Millisecond
+	defer func() { textSettle, pollInterval = oldSettle, oldPoll }()
+	got, err := e.followThread(ctx, lease.conn, "retry-502", "anchor", "hello", "", "", nil, nil, nil)
+	if err != nil || got == nil || got.text != "recovered after 502" {
+		t.Fatalf("expected recovery after transient 502s, got=%+v err=%v", got, err)
+	}
+	if polls.Load() < 4 {
+		t.Fatalf("expected at least 4 history polls, got %d", polls.Load())
+	}
+}

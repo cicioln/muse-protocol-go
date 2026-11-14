@@ -27,6 +27,7 @@ type Gateway struct {
 	Decisions []string // approval decisions received
 	// Optional immutable test hook; configure before serving any requests.
 	HistoryResponse func(sessionID string) ([]byte, bool)
+	HistoryStatus   func(sessionID string) int
 	// Files are extra workspace files served from /media/raw/<path>, keyed
 	// by path without a leading slash. Guarded by mu.
 	Files map[string][]byte
@@ -224,8 +225,15 @@ func (s *session) route(svc hatch.Service, id int64, req *hatch.AppRequest) {
 		}
 		go g.simulate(body.SessionID, body.Message, refs)
 	case req.Verb == "GET" && u.Path == "/chat/history":
+		sid := u.Query().Get("session_id")
+		if g.HistoryStatus != nil {
+			if code := g.HistoryStatus(sid); code >= 400 {
+				s.reply(id, code, []byte(`{"error":"bad gateway"}`), true)
+				return
+			}
+		}
 		if g.HistoryResponse != nil {
-			if body, ok := g.HistoryResponse(u.Query().Get("session_id")); ok {
+			if body, ok := g.HistoryResponse(sid); ok {
 				s.reply(id, 200, body, true)
 				return
 			}
