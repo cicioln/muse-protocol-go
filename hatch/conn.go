@@ -319,7 +319,7 @@ func (c *Conn) send(svc Service, f *Frame) error {
 }
 
 func (c *Conn) sendContext(ctx context.Context, svc Service, f *Frame) error {
-	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	select {
 	case c.writeGate <- struct{}{}:

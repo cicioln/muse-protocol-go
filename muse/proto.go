@@ -361,6 +361,7 @@ func imageItem(r RefImage, i int) map[string]any {
 // approval overrides Config.ApprovalPolicy for this turn when not empty.
 func (e *ProtoEngine) runTurn(ctx context.Context, a *protoLease, prompt string, refs []RefImage, want, approval string, onDelta func(string), progress func(int)) (*turnResult, error) {
 	conn := a.conn
+	refs = CompactRefImages(refs)
 	var items []map[string]any
 	for i, r := range refs {
 		items = append(items, imageItem(r, i))
