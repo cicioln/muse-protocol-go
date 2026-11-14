@@ -50,9 +50,12 @@ type VideoSegment struct {
 type LongVideoRequest struct {
 	Seconds        int
 	SegmentSeconds int // defaults to MaxVideoSegmentSeconds
-	Segment        func(VideoSegment) (prompt string, refs []RefImage)
-	Timeout        time.Duration // per segment; defaults to Config.GenerateTimeout
-	OnProgress     func(pct int)
+	// Plan, when non-empty, specifies the exact duration in seconds of each
+	// segment (1..MaxVideoSegmentSeconds) instead of splitting Seconds evenly.
+	Plan       []int
+	Segment    func(VideoSegment) (prompt string, refs []RefImage)
+	Timeout    time.Duration // per segment; defaults to Config.GenerateTimeout
+	OnProgress func(pct int)
 	// Join selects where segments are joined: JoinAuto (default), JoinVM or
 	// JoinLocal.
 	Join string
@@ -110,8 +113,25 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 	if r.Segment == nil {
 		return nil, BadRequest("segment callback is required")
 	}
-	if r.Seconds < 1 || r.Seconds > MaxLongVideoSeconds {
-		return nil, BadRequest("seconds must be between 1 and %d", MaxLongVideoSeconds)
+	var plan []int
+	if len(r.Plan) > 0 {
+		total := 0
+		plan = make([]int, len(r.Plan))
+		for i, s := range r.Plan {
+			if s < 1 || s > MaxVideoSegmentSeconds {
+				return nil, BadRequest("each segment in plan must be between 1 and %d seconds", MaxVideoSegmentSeconds)
+			}
+			plan[i] = s
+			total += s
+		}
+		if total > MaxLongVideoSeconds {
+			return nil, BadRequest("total planned seconds must not exceed %d", MaxLongVideoSeconds)
+		}
+	} else {
+		if r.Seconds < 1 || r.Seconds > MaxLongVideoSeconds {
+			return nil, BadRequest("seconds must be between 1 and %d", MaxLongVideoSeconds)
+		}
+		plan = SplitVideoSeconds(r.Seconds, r.SegmentSeconds)
 	}
 	switch r.Join {
 	case JoinAuto, JoinVM, JoinLocal:
@@ -122,7 +142,6 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 	if err != nil {
 		return nil, err
 	}
-	plan := SplitVideoSeconds(r.Seconds, r.SegmentSeconds)
 	progress := func(p int) {
 		if r.OnProgress != nil {
 			r.OnProgress(p)
