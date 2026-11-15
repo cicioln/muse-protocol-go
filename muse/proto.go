@@ -56,11 +56,26 @@ type protoAcct struct {
 }
 
 // protoLease pins the exact connection used by one operation. A later reconnect
-// must never change the connection underneath an already submitted turn.
+// must never change the connection underneath an already submitted turn, except
+// when this operation itself explicitly reconnects on disconnect.
 type protoLease struct {
 	*protoAcct
+	acc  *Account
+	mu   sync.Mutex
 	conn *hatch.Conn
 	sess *hatch.Session
+}
+
+func (l *protoLease) getConn() *hatch.Conn {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.conn
+}
+
+func (l *protoLease) setConn(conn *hatch.Conn, sess *hatch.Session) {
+	l.mu.Lock()
+	l.conn, l.sess = conn, sess
+	l.mu.Unlock()
 }
 
 var quotaRe = regexp.MustCompile(`(?i)out of credits|usage limit|limit reached|token limit|weekly limit reached|额度不足|积分不足|达到上限|用量已达`)
@@ -221,54 +236,63 @@ func (e *ProtoEngine) acquire(ctx context.Context, acc *Account) (*protoLease, e
 			e.release(acc.ID, &protoLease{protoAcct: a})
 		}
 	}()
+	conn, sess, err := e.ensureConn(ctx, acc.ID, acc, a)
+	if err != nil {
+		return nil, err
+	}
+	failed = false
+	return &protoLease{protoAcct: a, acc: acc, conn: conn, sess: sess}, nil
+}
+
+func (e *ProtoEngine) ensureConn(ctx context.Context, id string, acc *Account, a *protoAcct) (*hatch.Conn, *hatch.Session, error) {
 	select {
 	case a.connectGate <- struct{}{}:
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return nil, nil, ctx.Err()
 	}
 	defer func() { <-a.connectGate }()
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	e.mu.Lock()
-	valid := e.accts[acc.ID] == a && !e.closed
+	valid := e.accts[id] == a && !e.closed
 	conn := a.conn
+	sess := a.sess
 	e.mu.Unlock()
 	if !valid {
-		return nil, hatch.ErrClosed
+		return nil, nil, hatch.ErrClosed
 	}
 	if conn != nil && conn.Alive() {
-		failed = false
-		return &protoLease{protoAcct: a, conn: conn, sess: a.sess}, nil
+		return conn, sess, nil
 	}
 	var lastErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		if a.sess == nil || attempt > 0 || time.Since(a.sessAt) > 3*time.Minute {
-			sess, info, err := a.site.bootstrap(ctx)
-			e.persist(acc.ID, a, info)
+			bootSess, info, err := a.site.bootstrap(ctx)
+			e.persist(id, a, info)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			a.sess, a.sessAt = sess, time.Now()
+			a.sess, a.sessAt = bootSess, time.Now()
 		}
 		e.mu.Lock()
-		valid = e.accts[acc.ID] == a && !e.closed
+		valid = e.accts[id] == a && !e.closed
 		e.mu.Unlock()
 		if !valid {
 			a.site.client.CloseIdleConnections()
-			return nil, hatch.ErrClosed
+			return nil, nil, hatch.ErrClosed
 		}
 		conn, err := hatch.Connect(ctx, a.sess, hatch.Options{URL: e.cfg.GatewayURL, Proxy: e.wsProxy(acc), UserAgent: DefaultUA, Origin: e.cfg.SiteURL})
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, ctx.Err()
+				return nil, nil, ctx.Err()
 			}
 			lastErr = err
 			e.log.Warn("连接 hatch 网关失败", "attempt", attempt+1, "err", err)
 			continue
 		}
 		e.mu.Lock()
-		valid = e.accts[acc.ID] == a && !e.closed
+		valid = e.accts[id] == a && !e.closed
 		if valid {
 			a.conn = conn
 		}
@@ -276,17 +300,27 @@ func (e *ProtoEngine) acquire(ctx context.Context, acc *Account) (*protoLease, e
 		if !valid {
 			conn.Close()
 			a.site.client.CloseIdleConnections()
-			return nil, hatch.ErrClosed
+			return nil, nil, hatch.ErrClosed
 		}
-		lease := &protoLease{protoAcct: a, conn: conn, sess: a.sess}
-		e.registerNode(ctx, lease)
+		e.registerNode(ctx, conn, a.nodeID)
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
-		failed = false
-		return lease, nil
+		return conn, a.sess, nil
 	}
-	return nil, wrap(KindTransient, "无法建立 hatch 加密连接", lastErr)
+	return nil, nil, wrap(KindTransient, "无法建立 hatch 加密连接", lastErr)
+}
+
+func (e *ProtoEngine) reconnectLease(ctx context.Context, lease *protoLease) (*hatch.Conn, error) {
+	if lease == nil || lease.protoAcct == nil || lease.acc == nil {
+		return nil, hatch.ErrClosed
+	}
+	conn, sess, err := e.ensureConn(ctx, lease.acc.ID, lease.acc, lease.protoAcct)
+	if err != nil {
+		return nil, err
+	}
+	lease.setConn(conn, sess)
+	return conn, nil
 }
 
 func (e *ProtoEngine) release(id string, a *protoLease) {
@@ -316,11 +350,11 @@ func (e *ProtoEngine) persist(id string, a *protoAcct, info *SessionInfo) {
 	}
 }
 
-func (e *ProtoEngine) registerNode(ctx context.Context, a *protoLease) {
+func (e *ProtoEngine) registerNode(ctx context.Context, conn *hatch.Conn, nodeID string) {
 	cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	_, err := a.conn.DoJSON(cctx, hatch.ServiceDaemon, http.MethodPost, "/api/nodes/register", map[string]any{
-		"node_id": a.nodeID, "display_name": "Web", "platform": "web",
+	_, err := conn.DoJSON(cctx, hatch.ServiceDaemon, http.MethodPost, "/api/nodes/register", map[string]any{
+		"node_id": nodeID, "display_name": "Web", "platform": "web",
 		"commands_v2": map[string]any{"ping": map[string]any{"description": "Connection liveness check"}},
 	})
 	if err != nil {
@@ -360,7 +394,10 @@ func imageItem(r RefImage, i int) map[string]any {
 // /chat/history until it settles.
 // approval overrides Config.ApprovalPolicy for this turn when not empty.
 func (e *ProtoEngine) runTurn(ctx context.Context, a *protoLease, prompt string, refs []RefImage, want, approval string, onDelta func(string), progress func(int)) (*turnResult, error) {
-	conn := a.conn
+	conn := a.getConn()
+	reconnect := func(rctx context.Context) (*hatch.Conn, error) {
+		return e.reconnectLease(rctx, a)
+	}
 	refs = CompactRefImages(refs)
 	var items []map[string]any
 	for i, r := range refs {
@@ -375,7 +412,16 @@ func (e *ProtoEngine) runTurn(ctx context.Context, a *protoLease, prompt string,
 	})
 	st, err := conn.OpenContext(ctx, hatch.Request{Method: http.MethodPost, Path: "/chat/stream", Body: body})
 	if err != nil {
-		return nil, &NoRetry{Err: wrap(KindTransient, "发送消息失败，送达状态未知", err)}
+		var notSent *hatch.NotSentError
+		if errors.As(err, &notSent) && ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+			if newConn, rerr := reconnect(ctx); rerr == nil {
+				conn = newConn
+				st, err = conn.OpenContext(ctx, hatch.Request{Method: http.MethodPost, Path: "/chat/stream", Body: body})
+			}
+		}
+		if err != nil {
+			return nil, &NoRetry{Err: wrap(KindTransient, "发送消息失败，送达状态未知", err)}
+		}
 	}
 	defer st.Close()
 	messageID := ""
@@ -407,7 +453,7 @@ func (e *ProtoEngine) runTurn(ctx context.Context, a *protoLease, prompt string,
 			sig.record()
 		}
 	}()
-	result, err := e.followThread(ctx, conn, sessionID, messageID, prompt, want, approval, onDelta, progress, sig)
+	result, err := e.followThreadWithReconnect(ctx, conn, sessionID, messageID, prompt, want, approval, onDelta, progress, sig, reconnect)
 	if err != nil {
 		return nil, &NoRetry{Err: err}
 	}
@@ -486,6 +532,10 @@ func waitPoll(ctx context.Context, d time.Duration, polledAt time.Time, s *strea
 }
 
 func (e *ProtoEngine) followThread(ctx context.Context, conn *hatch.Conn, sessionID, messageID, prompt, want, approval string, onDelta func(string), progress func(int), sig *streamSignal) (*turnResult, error) {
+	return e.followThreadWithReconnect(ctx, conn, sessionID, messageID, prompt, want, approval, onDelta, progress, sig, nil)
+}
+
+func (e *ProtoEngine) followThreadWithReconnect(ctx context.Context, conn *hatch.Conn, sessionID, messageID, prompt, want, approval string, onDelta func(string), progress func(int), sig *streamSignal, reconnect func(context.Context) (*hatch.Conn, error)) (*turnResult, error) {
 	if approval == "" {
 		approval = e.cfg.ApprovalPolicy
 	}
@@ -493,19 +543,21 @@ func (e *ProtoEngine) followThread(ctx context.Context, conn *hatch.Conn, sessio
 		progress = func(int) {}
 	}
 	var (
-		sent, last     string
-		textStableAt   time.Time
-		mediaSig       string
-		mediaStableAt  time.Time
-		nextApproval   time.Time
-		res            = &turnResult{}
-		start          = time.Now()
-		found          bool
-		consecutiveErr int
-		activitySig    string
-		lastActivity   = time.Now()
-		lastBody       []byte
-		polledAt       time.Time
+		sent, last      string
+		textStableAt    time.Time
+		mediaSig        string
+		mediaStableAt   time.Time
+		nextApproval    time.Time
+		res             = &turnResult{}
+		start           = time.Now()
+		found           bool
+		consecutiveErr  int
+		reconnectErrs   int
+		totalReconnects int
+		activitySig     string
+		lastActivity    = time.Now()
+		lastBody        []byte
+		polledAt        time.Time
 		// Derived from the latest history body; recomputed only when it changes.
 		cur                             string
 		done, inProgress, turnCompleted bool
@@ -530,7 +582,35 @@ func (e *ProtoEngine) followThread(ctx context.Context, conn *hatch.Conn, sessio
 		cancel()
 		if err != nil {
 			if !conn.Alive() {
-				return nil, wrap(KindTransient, "hatch 连接中断", err)
+				if reconnect == nil || ctx.Err() != nil {
+					return nil, wrap(KindTransient, "hatch 连接中断", err)
+				}
+				totalReconnects++
+				if totalReconnects > 20 {
+					return nil, wrap(KindTransient, "hatch 连接中断", err)
+				}
+				newConn, rerr := reconnect(ctx)
+				if rerr != nil {
+					if ctx.Err() != nil {
+						return nil, wrap(KindTransient, "等待回复中断", ctx.Err())
+					}
+					if k := KindOf(rerr); k != KindTransient && k != KindRateLimit {
+						return nil, rerr
+					}
+					reconnectErrs++
+					if reconnectErrs > 5 {
+						return nil, wrap(KindTransient, "hatch 连接中断", rerr)
+					}
+					_ = sleep(ctx, backoff(time.Second, time.Duration(reconnectErrs)*2*time.Second))
+					continue
+				}
+				e.log.Debug("hatch 连接中断，已重连并继续跟踪会话", "session_id", sessionID)
+				conn = newConn
+				sig = nil
+				consecutiveErr = 0
+				reconnectErrs = 0
+				_ = sleep(ctx, 200*time.Millisecond)
+				continue
 			}
 			if consecutiveErr++; consecutiveErr > 10 {
 				return nil, wrap(KindTransient, "读取对话历史失败", err)
@@ -549,6 +629,7 @@ func (e *ProtoEngine) followThread(ctx context.Context, conn *hatch.Conn, sessio
 			return nil, classifyHTTPError("/chat/history", resp.Status, string(resp.Body), resp.Headers)
 		}
 		consecutiveErr = 0
+		reconnectErrs = 0
 		// An unchanged body yields the same events, so only the time-based
 		// settle checks below need to run again.
 		if !found || !bytes.Equal(resp.Body, lastBody) {
@@ -1107,7 +1188,7 @@ const maxMediaBytes = 512 << 20
 
 // fetchAll downloads artifacts a few at a time, keeping their order. It
 // returns what succeeded and the last error.
-func (e *ProtoEngine) fetchAll(ctx context.Context, conn *hatch.Conn, acc *Account, list []mediaRef) ([]Media, error) {
+func (e *ProtoEngine) fetchAll(ctx context.Context, lease *protoLease, list []mediaRef) ([]Media, error) {
 	saved := make([]*Media, len(list))
 	errs := make([]error, len(list))
 	gate := make(chan struct{}, 4)
@@ -1118,7 +1199,7 @@ func (e *ProtoEngine) fetchAll(ctx context.Context, conn *hatch.Conn, acc *Accou
 			defer wg.Done()
 			gate <- struct{}{}
 			defer func() { <-gate }()
-			saved[i], errs[i] = e.fetchMedia(ctx, conn, acc, m)
+			saved[i], errs[i] = e.fetchMedia(ctx, lease, m)
 		}()
 	}
 	wg.Wait()
@@ -1136,7 +1217,7 @@ func (e *ProtoEngine) fetchAll(ctx context.Context, conn *hatch.Conn, acc *Accou
 
 // fetchMedia downloads one artifact straight into the media directory, so a
 // the caller consumes chunks instead of retaining a second whole-file copy.
-func (e *ProtoEngine) fetchMedia(ctx context.Context, conn *hatch.Conn, acc *Account, m mediaRef) (*Media, error) {
+func (e *ProtoEngine) fetchMedia(ctx context.Context, lease *protoLease, m mediaRef) (*Media, error) {
 	dir := e.cfg.MediaDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
@@ -1154,7 +1235,7 @@ func (e *ProtoEngine) fetchMedia(ctx context.Context, conn *hatch.Conn, acc *Acc
 			_ = os.Remove(tmp)
 		}
 	}()
-	mime, size, err := e.download(ctx, conn, acc, m, f)
+	mime, size, err := e.download(ctx, lease, m, f)
 	if err != nil {
 		return nil, err
 	}
@@ -1175,7 +1256,7 @@ func (e *ProtoEngine) fetchMedia(ctx context.Context, conn *hatch.Conn, acc *Acc
 
 // download writes a VM workspace file fetched over the gateway (or a plain
 // URL) into f, replacing what an earlier failed attempt left there.
-func (e *ProtoEngine) download(ctx context.Context, conn *hatch.Conn, acc *Account, m mediaRef, f *os.File) (string, int64, error) {
+func (e *ProtoEngine) download(ctx context.Context, lease *protoLease, m mediaRef, f *os.File) (string, int64, error) {
 	reset := func() error {
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			return err
@@ -1186,19 +1267,33 @@ func (e *ProtoEngine) download(ctx context.Context, conn *hatch.Conn, acc *Accou
 	if m.Path != "" {
 		esc := (&url.URL{Path: m.Path}).EscapedPath()
 		for _, prefix := range []string{"/media/raw/", "/fs/raw/"} {
-			if err := reset(); err != nil {
-				return "", 0, err
+			for dlAttempt := 0; dlAttempt < 2; dlAttempt++ {
+				if err := reset(); err != nil {
+					return "", 0, err
+				}
+				conn := lease.getConn()
+				if conn == nil || !conn.Alive() {
+					reconn, rerr := e.reconnectLease(ctx, lease)
+					if rerr != nil {
+						lastErr = rerr
+						break
+					}
+					conn = reconn
+				}
+				cctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+				ct, n, err := copyGatewayFile(cctx, conn, prefix+esc, f)
+				cancel()
+				if err == nil && n > 0 {
+					return ct, n, nil
+				}
+				if err == nil {
+					err = fmt.Errorf("%s -> empty body", prefix+m.Path)
+				}
+				lastErr = err
+				if conn.Alive() || ctx.Err() != nil {
+					break
+				}
 			}
-			cctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-			ct, n, err := copyGatewayFile(cctx, conn, prefix+esc, f)
-			cancel()
-			if err == nil && n > 0 {
-				return ct, n, nil
-			}
-			if err == nil {
-				err = fmt.Errorf("%s -> empty body", prefix+m.Path)
-			}
-			lastErr = err
 		}
 	}
 	if strings.HasPrefix(m.URL, "http") {
@@ -1210,7 +1305,7 @@ func (e *ProtoEngine) download(ctx context.Context, conn *hatch.Conn, acc *Accou
 			return "", 0, err
 		}
 		req.Header.Set("User-Agent", DefaultUA)
-		client := httpClient(e.proxyFor(acc), 5*time.Minute)
+		client := httpClient(e.proxyFor(lease.acc), 5*time.Minute)
 		defer client.CloseIdleConnections()
 		resp, err := client.Do(req)
 		if err == nil {
@@ -1359,7 +1454,7 @@ func (e *ProtoEngine) Chat(ctx context.Context, acc *Account, prompt string, ref
 	res := &ChatResult{Text: turn.text}
 	// Images the assistant produced inside a normal chat are delivered too.
 	if refs := extractMedia(turn.events); len(refs) > 0 {
-		res.Media, _ = e.fetchAll(ctx, a.conn, acc, refs)
+		res.Media, _ = e.fetchAll(ctx, a, refs)
 	}
 	return res, nil
 }
@@ -1414,7 +1509,7 @@ func (e *ProtoEngine) Generate(ctx context.Context, acc *Account, r GenRequest) 
 	if len(list) > r.N {
 		list = list[len(list)-r.N:]
 	}
-	out, lastErr := e.fetchAll(ctx, a.conn, acc, list)
+	out, lastErr := e.fetchAll(ctx, a, list)
 	if len(out) == 0 {
 		return nil, &NoRetry{Err: wrap(KindTransient, "已生成但未能取回文件", lastErr)}
 	}

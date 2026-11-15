@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/CoolkHz/muse-protocol-go/hatch"
 	"github.com/CoolkHz/muse-protocol-go/internal/fakemuse"
 )
 
@@ -121,5 +122,51 @@ func TestFollowThreadRetriesTransient5xxFromHistory(t *testing.T) {
 	}
 	if polls.Load() < 4 {
 		t.Fatalf("expected at least 4 history polls, got %d", polls.Load())
+	}
+}
+
+func TestFollowThreadReconnectsAfterConnDrop(t *testing.T) {
+	site, gateway := fakemuse.NewWithGateway()
+	defer site.Close()
+
+	e, acc := newTestProto(t, site.URL, "ws"+strings.TrimPrefix(site.URL, "http")+"/v1/noise")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	lease, err := e.acquire(ctx, acc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.release(acc.ID, lease)
+
+	var polls atomic.Int32
+	gateway.HistoryResponse = func(sessionID string) ([]byte, bool) {
+		if sessionID != "reconnect-mid-turn" {
+			return nil, false
+		}
+		switch polls.Add(1) {
+		case 1:
+			return []byte(`{"chat_events":[{"event_name":"message.user","message_id":"anchor","text":"hello"},{"event_name":"message.assistant","payload":{"text":"working","status":"in_progress"}}]}`), true
+		case 2:
+			_ = lease.getConn().Close()
+			return nil, false
+		default:
+			return []byte(`{"chat_events":[{"event_name":"message.user","message_id":"anchor","text":"hello"},{"event_name":"message.assistant","payload":{"text":"recovered after reconnect","status":"completed"}}]}`), true
+		}
+	}
+
+	oldSettle, oldPoll := textSettle, pollInterval
+	textSettle, pollInterval = 10*time.Millisecond, 5*time.Millisecond
+	defer func() { textSettle, pollInterval = oldSettle, oldPoll }()
+
+	var reconnects atomic.Int32
+	got, err := e.followThreadWithReconnect(ctx, lease.getConn(), "reconnect-mid-turn", "anchor", "hello", "", "", nil, nil, nil, func(rctx context.Context) (*hatch.Conn, error) {
+		reconnects.Add(1)
+		return e.reconnectLease(rctx, lease)
+	})
+	if err != nil || got == nil || got.text != "recovered after reconnect" {
+		t.Fatalf("expected recovery after hatch reconnect, got=%+v err=%v", got, err)
+	}
+	if reconnects.Load() != 1 {
+		t.Fatalf("expected 1 reconnect, got %d", reconnects.Load())
 	}
 }

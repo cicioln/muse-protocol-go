@@ -157,3 +157,40 @@ func TestNextChunkAcceptsValidMediaBurstWhileConsumerIsPaused(t *testing.T) {
 		t.Fatalf("truncated media: got %d bytes", total)
 	}
 }
+
+func TestOpenContextPreSendReturnsNotSentError(t *testing.T) {
+	closed := make(chan struct{})
+	close(closed)
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	c := &Conn{closed: closed, writeGate: make(chan struct{}, 1), streams: map[int64]*Stream{}}
+	if _, err := c.OpenContext(canceled, Request{Method: "GET", Path: "/ping"}); err == nil {
+		t.Fatal("expected error for canceled context")
+	} else {
+		var ns *NotSentError
+		if !errors.As(err, &ns) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected NotSentError(context.Canceled), got %T: %v", err, err)
+		}
+	}
+
+	if _, err := c.OpenContext(context.Background(), Request{Method: "GET", Path: "/ping"}); err == nil {
+		t.Fatal("expected error for closed conn")
+	} else {
+		var ns *NotSentError
+		if !errors.As(err, &ns) || !errors.Is(err, ErrClosed) {
+			t.Fatalf("expected NotSentError(ErrClosed), got %T: %v", err, err)
+		}
+	}
+
+	cErr := &Conn{err: ErrClosed, closed: closed, writeGate: make(chan struct{}, 1), streams: map[int64]*Stream{}}
+	if _, err := cErr.OpenContext(context.Background(), Request{Method: "GET", Path: "/ping"}); err == nil {
+		t.Fatal("expected error for failed conn")
+	} else {
+		var ns *NotSentError
+		if !errors.As(err, &ns) || !errors.Is(err, ErrClosed) {
+			t.Fatalf("expected NotSentError(ErrClosed), got %T: %v", err, err)
+		}
+	}
+}

@@ -318,29 +318,43 @@ func (c *Conn) send(svc Service, f *Frame) error {
 	return c.sendContext(context.Background(), svc, f)
 }
 
+// NotSentError wraps a failure that occurred before any byte or cipher nonce of
+// the request was sent. Callers may safely reconnect and resend the request.
+type NotSentError struct{ Err error }
+
+func (e *NotSentError) Error() string { return e.Err.Error() }
+func (e *NotSentError) Unwrap() error { return e.Err }
+
 func (c *Conn) sendContext(ctx context.Context, svc Service, f *Frame) error {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 	select {
 	case c.writeGate <- struct{}{}:
 	case <-ctx.Done():
-		return ctx.Err()
+		return &NotSentError{Err: ctx.Err()}
 	case <-c.closed:
-		return ErrClosed
+		return &NotSentError{Err: ErrClosed}
 	}
 	defer func() { <-c.writeGate }()
 	if err := ctx.Err(); err != nil {
-		return err
+		return &NotSentError{Err: err}
 	}
-	env := EncodeRequest(svc, f)
 	if !c.Alive() {
 		if err := c.Err(); err != nil {
-			return err
+			return &NotSentError{Err: err}
 		}
-		return ErrClosed
+		return &NotSentError{Err: ErrClosed}
 	}
+	env := EncodeRequest(svc, f)
+	// Once chunks begin encrypting with c.tx, cancelling mid-write closes the
+	// shared WebSocket and breaks all other multiplexed streams. Decouple the
+	// socket write timeout from individual HTTP caller cancellations while still
+	// bounding stalled writes and aborting immediately if c.Close/shutdown closes
+	// c.ws.
+	wctx, wcancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer wcancel()
 	for _, chunk := range SplitChunks(env, sendChunkPayload) {
-		if err := c.ws.WriteBinaryContext(ctx, c.tx.Encrypt(nil, chunk)); err != nil {
+		if err := c.ws.WriteBinaryContext(wctx, c.tx.Encrypt(nil, chunk)); err != nil {
 			c.shutdown(err)
 			return err
 		}
@@ -366,12 +380,13 @@ func (c *Conn) Open(r Request) (*Stream, error) {
 // OpenContext includes queueing and sending in the caller's deadline.
 func (c *Conn) OpenContext(ctx context.Context, r Request) (*Stream, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, &NotSentError{Err: err}
 	}
 	c.mu.Lock()
 	if c.err != nil {
+		err := c.err
 		c.mu.Unlock()
-		return nil, c.err
+		return nil, &NotSentError{Err: err}
 	}
 	id := c.nextID
 	c.nextID++

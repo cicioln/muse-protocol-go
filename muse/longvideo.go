@@ -178,7 +178,7 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 					progress((i*100 + p) * 90 / (len(plan) * 100))
 				},
 			})
-			if err == nil || !Retryable(err) || KindOf(err) != KindTransient {
+			if err == nil || !canRetrySegment(ctx, err) {
 				break
 			}
 		}
@@ -251,6 +251,23 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 	}
 	progress(100)
 	return out, nil
+}
+
+func canRetrySegment(ctx context.Context, err error) bool {
+	if err == nil || ctx.Err() != nil {
+		return false
+	}
+	if Retryable(err) {
+		return KindOf(err) == KindTransient
+	}
+	if KindOf(err) != KindTransient {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var exhausted *exhaustedToolError
+	return !errors.As(err, &exhausted)
 }
 
 func segmentError(err error, index, count int) error {
@@ -424,7 +441,7 @@ func (e *ProtoEngine) joinOnVM(ctx context.Context, acc *Account, j *joinJob) (*
 	if result == nil {
 		return nil, errf(KindTransient, "VM 没有返回拼接后的视频：%s", clip(turn.text, 200))
 	}
-	files, err := e.fetchAll(ctx, a.conn, acc, []mediaRef{*result})
+	files, err := e.fetchAll(ctx, a, []mediaRef{*result})
 	if len(files) == 0 {
 		return nil, wrap(KindTransient, "下载拼接后的视频失败", err)
 	}

@@ -53,6 +53,15 @@ type NoRetry struct{ Err error }
 
 func (e *NoRetry) Error() string { return e.Err.Error() }
 func (e *NoRetry) Unwrap() error { return e.Err }
+
+// exhaustedToolError marks an upstream tool failure that already exhausted its
+// own retries, distinguishing it from transport/polling NoRetry errors so long
+// video segments do not blindly re-run hopeless tool calls.
+type exhaustedToolError struct{ Err error }
+
+func (e *exhaustedToolError) Error() string { return e.Err.Error() }
+func (e *exhaustedToolError) Unwrap() error { return e.Err }
+
 func Retryable(err error) bool {
 	var n *NoRetry
 	if errors.As(err, &n) {

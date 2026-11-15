@@ -54,7 +54,7 @@ func (f *toolFailure) error(kind string) error {
 	}
 	// The tool has already retried upstream, so another attempt on a
 	// different account would most likely fail the same way.
-	return &NoRetry{Err: errf(KindTransient, "%s", msg)}
+	return &NoRetry{Err: &exhaustedToolError{Err: errf(KindTransient, "%s", msg)}}
 }
 
 func containsAny(s string, subs []string) bool {

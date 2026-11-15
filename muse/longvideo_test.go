@@ -390,3 +390,29 @@ func TestLocalJoinsShareFFmpegGate(t *testing.T) {
 		}
 	}
 }
+
+func TestCanRetrySegment(t *testing.T) {
+	ctx := context.Background()
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+
+	hatchDrop := &NoRetry{Err: wrap(KindTransient, "hatch 连接中断", io.EOF)}
+	if !canRetrySegment(ctx, hatchDrop) {
+		t.Fatal("expected NoRetry hatch disconnect to be locally retryable by GenerateLongVideo")
+	}
+	if canRetrySegment(canceled, hatchDrop) {
+		t.Fatal("must not retry segment once parent context is canceled")
+	}
+
+	toolExhausted := &NoRetry{Err: &exhaustedToolError{Err: errf(KindTransient, "执行失败")}}
+	if canRetrySegment(ctx, toolExhausted) {
+		t.Fatal("exhausted tool errors should not trigger another outer segment turn")
+	}
+
+	if canRetrySegment(ctx, &NoRetry{Err: wrap(KindTransient, "timeout", context.DeadlineExceeded)}) {
+		t.Fatal("deadline exceeded must not retry segment")
+	}
+	if canRetrySegment(ctx, errf(KindRefusal, "content policy")) {
+		t.Fatal("non-transient errors must not retry segment")
+	}
+}
