@@ -11,7 +11,7 @@ func TestParseStoryboardRespectsCustom15sUnder20sCeiling(t *testing.T) {
   {"seconds": 7, "continuous_from_prev": true, "prompt": "1-7s: 镜头一，男主在雨夜街头驻足"},
   {"seconds": 8, "continuous_from_prev": false, "prompt": "7-15s: 镜头二，切到霓虹招牌特写"}
 ]` + "\n```"
-	shots, err := parseStoryboard(reply, 20, 10)
+	shots, _, err := parseStoryboard(reply, 20, 10)
 	if err != nil {
 		t.Fatalf("parseStoryboard: %v", err)
 	}
@@ -31,7 +31,7 @@ func TestParseStoryboardSplitsOver10sShotAndCapsTotal(t *testing.T) {
 		{"seconds": 14, "continuous_from_prev": false, "prompt": "long opening tracking shot"},
 		{"seconds": 10, "continuous_from_prev": true, "prompt": "closing shot"}
 	]}`
-	shots, err := parseStoryboard(reply, 20, 10)
+	shots, _, err := parseStoryboard(reply, 20, 10)
 	if err != nil {
 		t.Fatalf("parseStoryboard: %v", err)
 	}
@@ -44,6 +44,56 @@ func TestParseStoryboardSplitsOver10sShotAndCapsTotal(t *testing.T) {
 	}
 	if shots[0].ContinuousFromPrev || !shots[1].ContinuousFromPrev || !shots[2].ContinuousFromPrev {
 		t.Fatalf("unexpected continuity flags: %+v", shots)
+	}
+}
+
+func TestParseStoryboardReadsCharacters(t *testing.T) {
+	reply := "好的，分镜如下：\n```json\n" + `{
+  "characters": "女孩A：约20岁，黑色齐肩短发，红色连帽卫衣，蓝色牛仔裤",
+  "shots": [
+    {"seconds": 10, "continuous_from_prev": false, "prompt": "女孩A走进雨夜街头"},
+    {"seconds": 10, "continuous_from_prev": true, "prompt": "女孩A抬头看霓虹招牌"}
+  ]
+}` + "\n```"
+	shots, characters, err := parseStoryboard(reply, 20, 10)
+	if err != nil {
+		t.Fatalf("parseStoryboard: %v", err)
+	}
+	if len(shots) != 2 || shots[1].Prompt != "女孩A抬头看霓虹招牌" {
+		t.Fatalf("shots = %+v, want the two shots from the object", shots)
+	}
+	if !strings.Contains(characters, "红色连帽卫衣") {
+		t.Fatalf("characters = %q, want the description", characters)
+	}
+}
+
+func TestCharacterTextAcceptsListAndObject(t *testing.T) {
+	if got := characterText([]byte(`["A: red hoodie", {"B": "grey coat"}]`)); got != "A: red hoodie\nB: grey coat" {
+		t.Fatalf("list: got %q", got)
+	}
+	if got := characterText([]byte(`{"Mia": "red hoodie", "Leo": "grey coat"}`)); got != "Leo: grey coat\nMia: red hoodie" {
+		t.Fatalf("object: got %q", got)
+	}
+	if got := characterText([]byte(`null`)); got != "" {
+		t.Fatalf("null: got %q", got)
+	}
+}
+
+func TestWithCharactersPrefixesEveryShotOnce(t *testing.T) {
+	desc := "Mia: about 20, black bob, red hoodie"
+	shots := finalizeStoryboard("Mia walks through rain", []VideoShot{
+		{Seconds: 3, Prompt: "Mia walks"},
+		{Seconds: 3, ContinuousFromPrev: true, Prompt: "Mia stops"},
+		{Seconds: 8, Prompt: "Mia looks up"},
+	}, 20, 20, 10)
+	shots = withCharacters(shots, desc)
+	for i, s := range shots {
+		if strings.Count(s.Prompt, desc) != 1 || !strings.HasPrefix(s.Prompt, "Characters") {
+			t.Fatalf("shot %d prompt = %q, want the description once at the start", i, s.Prompt)
+		}
+	}
+	if got := withCharacters([]VideoShot{{Seconds: 5, Prompt: "p"}}, " "); got[0].Prompt != "p" {
+		t.Fatalf("empty description changed the prompt: %q", got[0].Prompt)
 	}
 }
 

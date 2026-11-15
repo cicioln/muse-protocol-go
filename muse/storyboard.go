@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -36,7 +37,10 @@ const defaultStoryboardTimeout = 45 * time.Second
 
 // PlanStoryboard asks Muse (in a fast text-only director turn) to break a
 // video prompt into a sequence of timed shots with per-shot durations,
-// transition continuity flags, and visual prompts.
+// transition continuity flags, and visual prompts. When the plan describes
+// recurring characters, that description is put word for word at the start
+// of every shot's prompt: rewording a character between segments is the
+// main cause of the face or clothes changing from one segment to the next.
 func (e *ProtoEngine) PlanStoryboard(ctx context.Context, acc *Account, r StoryboardRequest) ([]VideoShot, error) {
 	prompt := strings.TrimSpace(r.Prompt)
 	if prompt == "" {
@@ -85,11 +89,26 @@ func (e *ProtoEngine) PlanStoryboard(ctx context.Context, acc *Account, r Storyb
 	if err := classifyChatNotice(turn.text); err != nil {
 		return nil, err
 	}
-	shots, err := parseStoryboard(turn.text, maxSec, segMax)
+	shots, characters, err := parseStoryboard(turn.text, maxSec, segMax)
 	if err != nil {
 		return nil, wrap(KindTransient, "解析分镜规划失败", err)
 	}
-	return finalizeStoryboard(r.Prompt, shots, maxSec, targetSec, segMax), nil
+	shots = finalizeStoryboard(r.Prompt, shots, maxSec, targetSec, segMax)
+	return withCharacters(shots, characters), nil
+}
+
+// withCharacters puts the shared character description at the start of
+// every shot's prompt. It runs after the shots are merged and expanded, so
+// each prompt gets the description exactly once.
+func withCharacters(shots []VideoShot, characters string) []VideoShot {
+	characters = strings.TrimSpace(characters)
+	if characters == "" {
+		return shots
+	}
+	for i := range shots {
+		shots[i].Prompt = "Characters (keep their appearance exactly as described here in this shot):\n" + characters + "\n\nShot:\n" + shots[i].Prompt
+	}
+	return shots
 }
 
 func maxPreferredShots(total, segMax int) int {
@@ -114,16 +133,16 @@ func maxPreferredShots(total, segMax int) int {
 func formatStoryboardExample(targetSec, segMax int) string {
 	parts := SplitVideoSeconds(targetSec, segMax)
 	var b strings.Builder
-	b.WriteString("[\n")
+	b.WriteString("{\n  \"characters\": \"...\",\n  \"shots\": [\n")
 	for i, sec := range parts {
 		cont := i > 0
-		fmt.Fprintf(&b, "  {\n    \"seconds\": %d,\n    \"continuous_from_prev\": %t,\n    \"prompt\": \"...\"\n  }", sec, cont)
+		fmt.Fprintf(&b, "    {\n      \"seconds\": %d,\n      \"continuous_from_prev\": %t,\n      \"prompt\": \"...\"\n    }", sec, cont)
 		if i < len(parts)-1 {
 			b.WriteByte(',')
 		}
 		b.WriteByte('\n')
 	}
-	b.WriteByte(']')
+	b.WriteString("  ]\n}")
 	return b.String()
 }
 
@@ -137,7 +156,7 @@ func buildStoryboardPrompt(r StoryboardRequest, maxSec, targetSec, segMax int) s
 
 	var b strings.Builder
 	b.WriteString("You are a professional AI film director planning the shot-by-shot storyboard for a multi-segment video.\n")
-	b.WriteString("IMPORTANT: Do NOT call any image generation, video generation, web search, or shell tools. Reply ONLY with a raw JSON array of shot objects.\n\n")
+	b.WriteString("IMPORTANT: Do NOT call any image generation, video generation, web search, or shell tools. Reply ONLY with one raw JSON object holding \"characters\" and \"shots\".\n\n")
 	fmt.Fprintf(&b, "Constraints:\n- Maximum allowed total video duration: %d seconds.\n", maxSec)
 	fmt.Fprintf(&b, "- Required default total duration: %d seconds (keep the total at %d seconds unless the user explicitly writes custom shot timestamps or a specific shorter total duration).\n", targetSec, targetSec)
 	fmt.Fprintf(&b, "- Each shot object represents ONE video generation call and MUST have \"seconds\" between %d and %d (strongly prefer %d to %d seconds per shot for smooth motion and high reliability).\n", minShot, segMax, prefMin, segMax)
@@ -155,9 +174,14 @@ Rules:
    - For any subsequent shot (index > 0):
      * Set "continuous_from_prev": true if it continues smoothly in the same scene and camera flow from the end of the previous shot (the system will attach the previous shot's final frame as this shot's opening frame).
      * Set "continuous_from_prev": false if it is a hard cut to a new scene, a different location, or a distinct camera angle where starting from the previous shot's last frame would lock or distort the composition.
-4. Per-Shot Prompt ("prompt"):
-   - Write a rich, self-contained visual prompt for each shot in the same language as the user's description.
-   - Describe the subject appearance, concrete action that starts and completes naturally within that shot's exact "seconds" duration, camera framing/movement, lighting, and a clean ending pose/composition.
+4. Characters ("characters"):
+   - Each shot is generated in a separate call, and the system puts this exact text at the start of every shot's prompt, so the characters must be fully defined here once.
+   - For every person, animal or creature that appears in more than one shot, give a short label and a precise, fixed description: age, gender, face and build, hairstyle and hair color, every piece of clothing with its exact color and style, and accessories. When attached reference images show a character, describe them as they look in the images.
+   - Write it in the same language as the user's description. Use "" when no character appears in more than one shot.
+5. Per-Shot Prompt ("prompt"):
+   - Write a rich visual prompt for each shot in the same language as the user's description.
+   - Refer to characters only by their labels from "characters". Do NOT restate, reword or change their appearance or clothing inside a shot's prompt.
+   - Describe the concrete action that starts and completes naturally within that shot's exact "seconds" duration, the setting, camera framing/movement, lighting, and a clean ending pose/composition.
    - Do NOT include timestamps of other shots inside a shot's "prompt".
 `)
 	if r.HasFirstFrame && r.HasLastFrame {
@@ -168,7 +192,7 @@ Rules:
 		b.WriteString("\nAttached reference images are references for characters, objects, and visual style.\n")
 	}
 	if r.AspectRatio != "" {
-		b.WriteString("Aspect ratio: " + r.AspectRatio + "\n")
+		b.WriteString("Aspect ratio: exactly " + r.AspectRatio + "\n")
 	}
 	if r.CameraMovement != "" {
 		b.WriteString("Preferred camera movement: " + r.CameraMovement + "\n")
@@ -179,7 +203,7 @@ Rules:
 	if r.NegativePrompt != "" {
 		b.WriteString("Avoid: " + r.NegativePrompt + "\n")
 	}
-	fmt.Fprintf(&b, "\nOutput format (raw JSON array only, no markdown commentary; example matching %ds total):\n%s\n\nUser video description:\n", targetSec, formatStoryboardExample(targetSec, segMax))
+	fmt.Fprintf(&b, "\nOutput format (raw JSON object only, no markdown commentary; example matching %ds total):\n%s\n\nUser video description:\n", targetSec, formatStoryboardExample(targetSec, segMax))
 	b.WriteString(r.Prompt)
 	return b.String()
 }
@@ -342,28 +366,34 @@ func expandStoryboardToTarget(shots []VideoShot, targetSec, segMax int) []VideoS
 	return out
 }
 
-func parseStoryboard(text string, maxSec, segMax int) ([]VideoShot, error) {
+// parseStoryboard reads the director's reply: an object with "characters"
+// and "shots" (or "storyboard"), or a bare array of shots. It returns the
+// shots and the shared character description.
+func parseStoryboard(text string, maxSec, segMax int) ([]VideoShot, string, error) {
 	if segMax <= 0 || segMax > MaxVideoSegmentSeconds {
 		segMax = MaxVideoSegmentSeconds
 	}
 	raw, err := extractStoryboardJSON(text)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var parsed []VideoShot
+	var characters string
 	if err := json.Unmarshal(raw, &parsed); err != nil {
 		var wrapper struct {
-			Shots      []VideoShot `json:"shots"`
-			Storyboard []VideoShot `json:"storyboard"`
+			Characters json.RawMessage `json:"characters"`
+			Shots      []VideoShot     `json:"shots"`
+			Storyboard []VideoShot     `json:"storyboard"`
 		}
 		if err2 := json.Unmarshal(raw, &wrapper); err2 != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if len(wrapper.Shots) > 0 {
 			parsed = wrapper.Shots
 		} else {
 			parsed = wrapper.Storyboard
 		}
+		characters = characterText(wrapper.Characters)
 	}
 	var out []VideoShot
 	total := 0
@@ -401,24 +431,63 @@ func parseStoryboard(text string, maxSec, segMax int) ([]VideoShot, error) {
 		}
 	}
 	if len(out) == 0 {
-		return nil, fmt.Errorf("empty storyboard")
+		return nil, "", fmt.Errorf("empty storyboard")
 	}
 	out[0].ContinuousFromPrev = false
-	return out, nil
+	return out, characters, nil
 }
 
-func extractStoryboardJSON(text string) ([]byte, error) {
-	text = strings.TrimSpace(text)
-	if start := strings.IndexByte(text, '['); start >= 0 {
-		if end := strings.LastIndexByte(text, ']'); end > start {
-			candidate := text[start : end+1]
-			if json.Valid([]byte(candidate)) {
-				return []byte(candidate), nil
+// characterText accepts "characters" as a string, or as a list or object of
+// per-character descriptions, which models sometimes return instead.
+func characterText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return strings.TrimSpace(s)
+	}
+	var list []json.RawMessage
+	if json.Unmarshal(raw, &list) == nil {
+		var lines []string
+		for _, item := range list {
+			if t := characterText(item); t != "" {
+				lines = append(lines, t)
 			}
 		}
+		return strings.Join(lines, "\n")
 	}
-	if start := strings.IndexByte(text, '{'); start >= 0 {
-		if end := strings.LastIndexByte(text, '}'); end > start {
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) == nil {
+		keys := make([]string, 0, len(obj))
+		for k := range obj {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		var lines []string
+		for _, k := range keys {
+			if t := characterText(obj[k]); t != "" {
+				lines = append(lines, k+": "+t)
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+	return ""
+}
+
+// extractStoryboardJSON returns the outermost JSON value in text, trying the
+// bracket that opens first so an object's inner "shots" array is not taken
+// for the whole reply.
+func extractStoryboardJSON(text string) ([]byte, error) {
+	text = strings.TrimSpace(text)
+	pairs := [][2]byte{{'[', ']'}, {'{', '}'}}
+	if o, a := strings.IndexByte(text, '{'), strings.IndexByte(text, '['); o >= 0 && (a < 0 || o < a) {
+		pairs[0], pairs[1] = pairs[1], pairs[0]
+	}
+	for _, p := range pairs {
+		start := strings.IndexByte(text, p[0])
+		end := strings.LastIndexByte(text, p[1])
+		if start >= 0 && end > start {
 			candidate := text[start : end+1]
 			if json.Valid([]byte(candidate)) {
 				return []byte(candidate), nil
