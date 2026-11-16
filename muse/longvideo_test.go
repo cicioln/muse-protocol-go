@@ -391,6 +391,42 @@ func TestLocalJoinsShareFFmpegGate(t *testing.T) {
 	}
 }
 
+func TestJoinOnVMJoinsEarlierClips(t *testing.T) {
+	ffmpeg := requireFFmpeg(t)
+	video, vmDir := clips(t, ffmpeg), t.TempDir()
+	eng, _, acc, cfg := longVideoEngine(t, func(gw *fakemuse.Gateway) {
+		gw.Video = video
+		gw.Join = fakeVMJoin(vmDir, ffmpeg)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	var vc []VMClip
+	for i := 0; i < 2; i++ {
+		files, err := eng.Generate(ctx, acc, GenRequest{Prompt: "Use your video generation tool. Clip " + strings.Repeat("I", i+1), Kind: "video", N: 1, Timeout: 20 * time.Second})
+		if err != nil || len(files) == 0 {
+			t.Fatalf("Generate clip %d: %v", i+1, err)
+		}
+		if files[0].Source == "" {
+			t.Fatalf("clip %d has no VM path", i+1)
+		}
+		local := filepath.Join(cfg.MediaDir(), files[0].Filename)
+		vc = append(vc, VMClip{Source: files[0].Source, Seconds: 2, Audio: hasAudio(ctx, ffmpeg, local)})
+	}
+	out, err := eng.JoinOnVM(ctx, acc, vc, 320, 180)
+	if err != nil {
+		t.Fatalf("JoinOnVM: %v", err)
+	}
+	if out.Width != 320 || out.Height != 180 || math.Abs(out.Seconds-4) > 0.25 {
+		t.Fatalf("joined video = %+v", out)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.MediaDir(), out.Filename)); err != nil {
+		t.Fatalf("joined video not saved: %v", err)
+	}
+	if _, err := eng.JoinOnVM(ctx, acc, vc[:1], 0, 0); KindOf(err) != KindBadRequest {
+		t.Fatalf("JoinOnVM with one clip: %v, want a bad request", err)
+	}
+}
+
 func TestCanRetrySegment(t *testing.T) {
 	ctx := context.Background()
 	canceled, cancel := context.WithCancel(ctx)

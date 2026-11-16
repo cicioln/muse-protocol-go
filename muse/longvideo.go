@@ -453,6 +453,39 @@ func (e *ProtoEngine) joinOnVM(ctx context.Context, acc *Account, j *joinJob) (*
 	return &joined, nil
 }
 
+// VMClip is one video already in the account's VM workspace, such as a
+// clip Generate returned earlier on the same account.
+type VMClip struct {
+	Source  string  // Media.Source of the clip
+	Seconds float64 // length to keep from its start
+	Audio   bool    // whether the clip has sound; clips without get silence
+}
+
+// JoinOnVM joins clips that are already in the account's VM workspace into
+// one H.264/AAC MP4 of w×h (0 means 1280×720), running ffmpeg on the VM, and
+// downloads the result into Config.MediaDir(). No video is generated and no
+// local ffmpeg is used. The clips must come from the same account, because
+// each account has its own VM.
+func (e *ProtoEngine) JoinOnVM(ctx context.Context, acc *Account, clips []VMClip, w, h int) (*Media, error) {
+	if len(clips) < 2 {
+		return nil, BadRequest("at least 2 clips are required")
+	}
+	if w <= 0 || h <= 0 {
+		w, h = 1280, 720
+	}
+	j := &joinJob{w: w &^ 1, h: h &^ 1}
+	for i, c := range clips {
+		src := strings.TrimPrefix(strings.TrimSpace(c.Source), "/")
+		if src == "" || c.Seconds <= 0 {
+			return nil, BadRequest("clip %d has no VM path or length", i+1)
+		}
+		j.segments = append(j.segments, Media{Source: src})
+		j.lengths = append(j.lengths, c.Seconds)
+		j.audio = append(j.audio, c.Audio)
+	}
+	return e.joinOnVM(ctx, acc, j)
+}
+
 // checkJoined rejects a joined video whose length or size is not what the
 // command should have produced.
 func checkJoined(m Media, j *joinJob) error {
