@@ -30,7 +30,14 @@ type StoryboardRequest struct {
 	CameraMovement string
 	Style          string
 	NegativePrompt string
-	Timeout        time.Duration // defaults to 45s
+	// Background is story context (setting, world, scenes) shown to the
+	// director only; it is not copied into the shot prompts.
+	Background string
+	// Characters is a fixed character description from the caller. When
+	// set, the director refers to characters by its labels instead of
+	// writing its own, and this text is put in every shot's prompt.
+	Characters string
+	Timeout    time.Duration // defaults to 45s
 }
 
 const defaultStoryboardTimeout = 45 * time.Second
@@ -93,6 +100,9 @@ func (e *ProtoEngine) PlanStoryboard(ctx context.Context, acc *Account, r Storyb
 	if err != nil {
 		return nil, wrap(KindTransient, "解析分镜规划失败", err)
 	}
+	if c := strings.TrimSpace(r.Characters); c != "" {
+		characters = c
+	}
 	shots = finalizeStoryboard(r.Prompt, shots, maxSec, targetSec, segMax)
 	return withCharacters(shots, characters), nil
 }
@@ -106,7 +116,7 @@ func withCharacters(shots []VideoShot, characters string) []VideoShot {
 		return shots
 	}
 	for i := range shots {
-		shots[i].Prompt = "Characters (keep their appearance exactly as described here in this shot):\n" + characters + "\n\nShot:\n" + shots[i].Prompt
+		shots[i].Prompt = "Recurring characters and places (keep their appearance exactly as described here in this shot):\n" + characters + "\n\nShot:\n" + shots[i].Prompt
 	}
 	return shots
 }
@@ -202,6 +212,12 @@ Rules:
 	}
 	if r.NegativePrompt != "" {
 		b.WriteString("Avoid: " + r.NegativePrompt + "\n")
+	}
+	if bg := strings.TrimSpace(r.Background); bg != "" {
+		b.WriteString("\nStory background (context for the whole film; keep every shot consistent with it):\n" + bg + "\n")
+	}
+	if c := strings.TrimSpace(r.Characters); c != "" {
+		b.WriteString("\nFixed characters and places (already defined by the user and added to every shot by the system; set \"characters\" to \"\" and refer to them only by these labels):\n" + c + "\n")
 	}
 	fmt.Fprintf(&b, "\nOutput format (raw JSON object only, no markdown commentary; example matching %ds total):\n%s\n\nUser video description:\n", targetSec, formatStoryboardExample(targetSec, segMax))
 	b.WriteString(r.Prompt)

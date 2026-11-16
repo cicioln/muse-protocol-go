@@ -88,12 +88,25 @@ func TestWithCharactersPrefixesEveryShotOnce(t *testing.T) {
 	}, 20, 20, 10)
 	shots = withCharacters(shots, desc)
 	for i, s := range shots {
-		if strings.Count(s.Prompt, desc) != 1 || !strings.HasPrefix(s.Prompt, "Characters") {
+		if strings.Count(s.Prompt, desc) != 1 || !strings.HasPrefix(s.Prompt, "Recurring characters") {
 			t.Fatalf("shot %d prompt = %q, want the description once at the start", i, s.Prompt)
 		}
 	}
 	if got := withCharacters([]VideoShot{{Seconds: 5, Prompt: "p"}}, " "); got[0].Prompt != "p" {
 		t.Fatalf("empty description changed the prompt: %q", got[0].Prompt)
+	}
+}
+
+func TestBuildStoryboardPromptIncludesBackgroundAndFixedCharacters(t *testing.T) {
+	got := buildStoryboardPrompt(StoryboardRequest{
+		Prompt:     "Mia finds the lantern",
+		Background: "A flooded city in 2090",
+		Characters: "- Mia: about 20, red hoodie",
+	}, 20, 20, 10)
+	for _, want := range []string{"A flooded city in 2090", "Fixed characters and places", "- Mia: about 20, red hoodie"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("prompt is missing %q:\n%s", want, got)
+		}
 	}
 }
 
