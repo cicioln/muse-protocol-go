@@ -1388,20 +1388,26 @@ func describeMedia(f io.ReaderAt, size int64, mime string, m mediaRef) *Media {
 	return &Media{Filename: randHex(16) + ext, Kind: kind, Mime: mime, Bytes: size, Width: w, Height: h, Seconds: secs, Source: m.Path}
 }
 
+// classifyTurnErr classifies the text of a media turn that produced no media.
+// The model often explains a refusal in words that mention limits ("the
+// prompt exceeds the token limit", "达到上限"), so, as for chat, only a brief
+// reply that starts like an upstream limit notice counts as one. The reply is
+// kept on the error as a *ModelReply.
 func classifyTurnErr(text string) error {
-	if len([]rune(text)) < 400 {
-		lower := strings.ToLower(text)
-		for _, marker := range []string{"rate limit", "too many requests", "请求过于频繁", "频率限制"} {
-			if strings.Contains(lower, marker) {
-				return errf(KindRateLimit, "上游限流")
-			}
-		}
+	err := classifyChatNotice(text)
+	if err == nil {
+		return nil
 	}
-	if quotaRe.MatchString(text) && len([]rune(text)) < 400 {
-		return errf(KindQuota, "账号额度不足")
-	}
-	return nil
+	e := err.(*Error)
+	e.Err = &ModelReply{Text: text}
+	return e
 }
+
+// ModelReply is the text the model answered with instead of media. Callers
+// find it with errors.As to log what upstream actually said.
+type ModelReply struct{ Text string }
+
+func (r *ModelReply) Error() string { return r.Text }
 
 // Chat replies are ordinary model text, so a keyword anywhere in a short
 // answer ("what is an API rate limit?") must not turn it into an error. Only
@@ -1502,7 +1508,7 @@ func (e *ProtoEngine) Generate(ctx context.Context, acc *Account, r GenRequest) 
 		if turn.text == "" {
 			return nil, &NoRetry{Err: errf(KindTransient, "等待生成超时，未出现新的%s", kindName(r.Kind))}
 		}
-		return nil, errf(KindRefusal, "模型未生成%s，仅返回文本", kindName(r.Kind))
+		return nil, wrap(KindRefusal, fmt.Sprintf("模型未生成%s，仅返回文本", kindName(r.Kind)), &ModelReply{Text: turn.text})
 	}
 	progress(80)
 	list := turn.media

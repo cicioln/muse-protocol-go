@@ -1,6 +1,9 @@
 package muse
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestChatNoticeIgnoresOrdinaryAnswers(t *testing.T) {
 	for _, text := range []string{
@@ -37,6 +40,30 @@ func TestChatNoticeClassifiesLimitMessages(t *testing.T) {
 		if err == nil || KindOf(err) != c.want {
 			t.Fatalf("%q: got %v, want kind %v", c.text, err, c.want)
 		}
+	}
+}
+
+func TestTurnErrIgnoresRefusalsThatMentionLimits(t *testing.T) {
+	for _, text := range []string{
+		"I can't generate this video because the prompt exceeds the token limit for a single clip.",
+		"抱歉，这个视频的时长达到上限，我无法生成。",
+		"This request hit a content usage limit policy, so I won't create it.",
+	} {
+		if err := classifyTurnErr(text); err != nil {
+			t.Fatalf("%q classified as %v", text, err)
+		}
+	}
+}
+
+func TestTurnErrKeepsReplyOnLimitNotice(t *testing.T) {
+	text := "You've reached your daily limit. Come back tomorrow."
+	err := classifyTurnErr(text)
+	if KindOf(err) != KindQuota {
+		t.Fatalf("got %v, want quota", err)
+	}
+	var reply *ModelReply
+	if !errors.As(err, &reply) || reply.Text != text {
+		t.Fatalf("reply not kept: %v", err)
 	}
 }
 
