@@ -137,7 +137,10 @@ func (c *siteClient) bootstrap(ctx context.Context) (*hatch.Session, *SessionInf
 		}
 		return nil, info, errf(KindTransient, "muse.ai 未分配 VM")
 	}
-	if !strings.EqualFold(info.VMState, "RUNNING") {
+	// Since 2026-11-16 the site reports UNKNOWN for VMs that are up and
+	// reachable through the gateway, and waking them never turns it into
+	// RUNNING. Only wait when the site names a state other than RUNNING.
+	if !strings.EqualFold(info.VMState, "RUNNING") && !strings.EqualFold(info.VMState, "UNKNOWN") && info.VMState != "" {
 		_, _, _ = c.do(ctx, http.MethodPost, "/api/hatch/vm/wake", map[string]any{
 			"vm_id": info.VMID, "retry_count": 1, "connect_attempt_id": newUUID()})
 		deadline := time.Now().Add(60 * time.Second)
