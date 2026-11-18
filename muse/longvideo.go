@@ -441,7 +441,7 @@ func (e *ProtoEngine) joinOnVM(ctx context.Context, acc *Account, j *joinJob) (*
 	if result == nil {
 		return nil, errf(KindTransient, "VM 没有返回拼接后的视频：%s", clip(turn.text, 200))
 	}
-	dlCtx, dlCancel := context.WithTimeout(ctx, 4*time.Minute)
+	dlCtx, dlCancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer dlCancel()
 	files, err := e.fetchAll(dlCtx, a, []mediaRef{*result})
 	if len(files) == 0 {

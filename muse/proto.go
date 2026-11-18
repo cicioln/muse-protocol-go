@@ -1287,9 +1287,7 @@ func (e *ProtoEngine) download(ctx context.Context, lease *protoLease, m mediaRe
 					}
 					conn = reconn
 				}
-				cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
-				ct, n, err := copyGatewayFile(cctx, conn, prefix+esc, f)
-				cancel()
+				ct, n, err := copyGatewayFile(ctx, conn, prefix+esc, f)
 				if err == nil && n > 0 {
 					return ct, n, nil
 				}
@@ -1342,7 +1340,9 @@ func (e *ProtoEngine) download(ctx context.Context, lease *protoLease, m mediaRe
 
 // copyGatewayFile streams one gateway response body into w.
 func copyGatewayFile(ctx context.Context, conn *hatch.Conn, path string, w io.Writer) (string, int64, error) {
-	st, err := conn.OpenContext(ctx, hatch.Request{Method: http.MethodGet, Path: path})
+	openCtx, openCancel := context.WithTimeout(ctx, 30*time.Second)
+	st, err := conn.OpenContext(openCtx, hatch.Request{Method: http.MethodGet, Path: path})
+	openCancel()
 	if err != nil {
 		return "", 0, err
 	}
@@ -1527,7 +1527,7 @@ func (e *ProtoEngine) Generate(ctx context.Context, acc *Account, r GenRequest) 
 	if len(list) > r.N {
 		list = list[len(list)-r.N:]
 	}
-	dlCtx, dlCancel := context.WithTimeout(ctx, 4*time.Minute)
+	dlCtx, dlCancel := context.WithTimeout(ctx, 6*time.Minute)
 	defer dlCancel()
 	out, lastErr := e.fetchAll(dlCtx, a, list)
 	if len(out) == 0 {
