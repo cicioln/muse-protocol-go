@@ -780,7 +780,7 @@ func mediaTextOnlySettled(text, want string, done, assistantActive, historyActiv
 	if text == "" || !done || assistantActive || historyActive || quietFor < textSettle {
 		return false
 	}
-	if turnCompleted || isRefusal(text) {
+	if want == "video" || turnCompleted || isRefusal(text) {
 		return true
 	}
 	// A completed question/non-progress answer gets a grace period for tool
