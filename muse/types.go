@@ -101,6 +101,19 @@ type GenRequest struct {
 	N          int
 	Timeout    time.Duration
 	OnProgress func(pct int)
+	// State and SaveState resume observation/download of the same turn, never
+	// resubmit it. Persist state privately: media URLs may grant file access.
+	State     *GenerationState
+	SaveState func(*GenerationState) error
+	OnStage   func(string)
+}
+
+type GenerationState struct {
+	AccountID string     `json:"account_id,omitempty"`
+	SessionID string     `json:"session_id,omitempty"`
+	MessageID string     `json:"message_id,omitempty"`
+	Deadline  time.Time  `json:"deadline,omitempty"`
+	Media     []mediaRef `json:"media,omitempty"`
 }
 
 // Media describes an output saved in Config.MediaDir(). Measurements describe

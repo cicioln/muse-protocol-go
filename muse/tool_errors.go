@@ -13,10 +13,11 @@ import (
 //	{"status":"error","error":"upstream_unavailable","attempts":3,
 //	 "failure_scope":"upstream","upstream_status":502,"retry_exhausted":true}
 type toolFailure struct {
-	code     string
-	scope    string
-	upstream int
-	attempts int
+	code      string
+	scope     string
+	upstream  int
+	attempts  int
+	exhausted bool
 }
 
 var policyCodes = []string{"policy", "safety", "moderation", "blocked", "rejected", "refus"}
@@ -70,7 +71,8 @@ func containsAny(s string, subs []string) bool {
 // message, or nil. User and root assistant messages are skipped: their text
 // is the conversation, not tool output.
 func findToolFailure(events []map[string]any) *toolFailure {
-	var found *toolFailure
+	failures := map[string]*toolFailure{}
+	var order []string
 	for _, ev := range events {
 		switch eventName(ev) {
 		case "message.user":
@@ -81,9 +83,34 @@ func findToolFailure(events []map[string]any) *toolFailure {
 				continue
 			}
 		}
-		walkToolFailures(ev, 0, func(f *toolFailure) { found = f })
+		key := toolEventID(ev)
+		p, _ := ev["payload"].(map[string]any)
+		active, completed := mediaLifecycle(p)
+		if active || completed {
+			delete(failures, key)
+		}
+		walkToolFailures(ev, 0, func(f *toolFailure) { failures[key] = f; order = append(order, key) })
 	}
-	return found
+	for i := len(order) - 1; i >= 0; i-- {
+		if f := failures[order[i]]; f != nil {
+			return f
+		}
+	}
+	return nil
+}
+
+func toolEventID(ev map[string]any) string {
+	p, _ := ev["payload"].(map[string]any)
+	for _, field := range []string{"tool_call_id", "call_id", "message_id", "id"} {
+		id := str(ev, field)
+		if id == "" {
+			id = str(p, field)
+		}
+		if id != "" {
+			return "id:" + id
+		}
+	}
+	return "type:" + eventName(ev)
 }
 
 const maxToolFailureDepth = 10
@@ -129,10 +156,11 @@ func toolFailureOf(m map[string]any) *toolFailure {
 		return nil
 	}
 	return &toolFailure{
-		code:     clip(code, 120),
-		scope:    clip(firstString(m, "failure_scope", "failureScope"), 40),
-		upstream: upstream,
-		attempts: intField(m, "attempts", "attempt_count"),
+		code:      clip(code, 120),
+		scope:     clip(firstString(m, "failure_scope", "failureScope"), 40),
+		upstream:  upstream,
+		attempts:  intField(m, "attempts", "attempt_count"),
+		exhausted: m["retry_exhausted"] == true || m["retryExhausted"] == true,
 	}
 }
 

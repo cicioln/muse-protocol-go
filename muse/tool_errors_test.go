@@ -58,3 +58,13 @@ func TestToolFailureKinds(t *testing.T) {
 		}
 	}
 }
+
+func TestToolRecoveryClearsEarlierFailure(t *testing.T) {
+	events := []map[string]any{
+		{"event_name": "tool.result", "payload": map[string]any{"tool_call_id": "one", "status": "error", "error": "temporary", "retry_exhausted": true}},
+		{"event_name": "tool.result", "payload": map[string]any{"call_id": "one", "status": "success"}},
+	}
+	if f := findToolFailure(events); f != nil {
+		t.Fatalf("stale failure survived recovery: %+v", f)
+	}
+}

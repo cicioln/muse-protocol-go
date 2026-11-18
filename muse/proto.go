@@ -394,9 +394,20 @@ func imageItem(r RefImage, i int) map[string]any {
 // /chat/history until it settles.
 // approval overrides Config.ApprovalPolicy for this turn when not empty.
 func (e *ProtoEngine) runTurn(ctx context.Context, a *protoLease, prompt string, refs []RefImage, want, approval string, onDelta func(string), progress func(int)) (*turnResult, error) {
+	return e.runTurnResumable(ctx, a, prompt, refs, want, approval, onDelta, progress, nil, nil)
+}
+
+func (e *ProtoEngine) runTurnResumable(ctx context.Context, a *protoLease, prompt string, refs []RefImage, want, approval string, onDelta func(string), progress func(int), state *GenerationState, save func(*GenerationState) error) (*turnResult, error) {
 	conn := a.getConn()
 	reconnect := func(rctx context.Context) (*hatch.Conn, error) {
 		return e.reconnectLease(rctx, a)
+	}
+	if state != nil && state.SessionID != "" {
+		result, err := e.followThreadWithReconnect(ctx, conn, state.SessionID, state.MessageID, prompt, want, approval, onDelta, progress, nil, reconnect)
+		if err != nil {
+			return nil, &NoRetry{Err: err}
+		}
+		return result, nil
 	}
 	refs = CompactRefImages(refs)
 	var items []map[string]any
@@ -405,6 +416,14 @@ func (e *ProtoEngine) runTurn(ctx context.Context, a *protoLease, prompt string,
 	}
 	items = append(items, map[string]any{"type": "text", "text": prompt})
 	sessionID := newUUID()
+	if state != nil {
+		state.SessionID = sessionID
+		if save != nil {
+			if err := save(state); err != nil {
+				return nil, &NoRetry{Err: wrap(KindTransient, "保存生成会话失败", err)}
+			}
+		}
+	}
 	body, _ := json.Marshal(map[string]any{
 		"items": items, "message": prompt, "node_id": a.nodeID, "capabilities": capabilities,
 		"session_id": sessionID, "timezone": e.cfg.Timezone,
@@ -439,6 +458,14 @@ func (e *ProtoEngine) runTurn(ctx context.Context, a *protoLease, prompt string,
 			messageID = str(m, "id")
 		}
 	}
+	if state != nil {
+		state.MessageID = messageID
+		if save != nil {
+			if err := save(state); err != nil {
+				return nil, &NoRetry{Err: wrap(KindTransient, "保存生成会话失败", err)}
+			}
+		}
+	}
 	// Drain the rest of the stream so its buffer stays small. Its records are
 	// not parsed (the history is the source of truth) but they show when the
 	// thread changes, which lets polling slow down while it does not.
@@ -466,7 +493,7 @@ var (
 	pollInterval = 300 * time.Millisecond
 	// Quiet time before a finished non-progress reply ends a media turn.
 	imageTextOnlyGrace = 15 * time.Second
-	videoTextOnlyGrace = 2 * time.Minute
+	videoTextOnlyGrace = 15 * time.Second
 	// While the chat stream is open and quiet, nothing new is expected in the
 	// history; a stream record wakes the poller early.
 	streamQuietPoll = 1500 * time.Millisecond
@@ -744,6 +771,17 @@ func (e *ProtoEngine) followThreadWithReconnect(ctx context.Context, conn *hatch
 					quietSince = lastStream
 				}
 			}
+			// An exhausted tool result is authoritative even when the assistant
+			// never writes a final message. Do not mistake an intermediate tool
+			// failure for a final one while another tool is still running.
+			if len(res.media) == 0 && !historyInProgress && time.Since(quietSince) >= textSettle {
+				if failure := findToolFailure(res.events); failure != nil && failure.exhausted {
+					return nil, failure.error(want)
+				}
+				if turnCompleted {
+					return res, nil
+				}
+			}
 			if len(res.media) == 0 && mediaTextOnlySettled(cur, want, done, inProgress, historyInProgress, turnCompleted, time.Since(quietSince)) {
 				return res, nil
 			}
@@ -780,7 +818,7 @@ func mediaTextOnlySettled(text, want string, done, assistantActive, historyActiv
 	if text == "" || !done || assistantActive || historyActive || quietFor < textSettle {
 		return false
 	}
-	if want == "video" || turnCompleted || isRefusal(text) {
+	if turnCompleted || isRefusal(text) {
 		return true
 	}
 	// A completed question/non-progress answer gets a grace period for tool
@@ -826,17 +864,12 @@ func mediaHistoryInProgress(events []map[string]any) bool {
 		if name == "message.done" || name == "delta.message_done" {
 			continue
 		}
-		key := "type:" + name
-		for _, field := range []string{"tool_call_id", "call_id", "message_id", "id"} {
-			id := str(ev, field)
-			if id == "" {
-				id = str(p, field)
+		key := toolEventID(ev)
+		walkToolFailures(p, 0, func(f *toolFailure) {
+			if f.exhausted {
+				inProgress, completed = false, true
 			}
-			if id != "" {
-				key = "id:" + field + ":" + id
-				break
-			}
-		}
+		})
 		switch {
 		case inProgress:
 			active[key] = true
@@ -1478,6 +1511,9 @@ func (e *ProtoEngine) Chat(ctx context.Context, acc *Account, prompt string, ref
 }
 
 func (e *ProtoEngine) Generate(ctx context.Context, acc *Account, r GenRequest) ([]Media, error) {
+	if r.State != nil && r.State.AccountID != "" && (acc == nil || r.State.AccountID != acc.ID) {
+		return nil, BadRequest("generation checkpoint belongs to another account")
+	}
 	if err := validateRequest(r.Prompt, r.Refs); err != nil {
 		return nil, err
 	}
@@ -1495,18 +1531,41 @@ func (e *ProtoEngine) Generate(ctx context.Context, acc *Account, r GenRequest) 
 			r.OnProgress(p)
 		}
 	}
+	stage := func(name string) {
+		if r.OnStage != nil {
+			r.OnStage(name)
+		}
+	}
+	stage("connecting")
 	a, err := e.acquire(ctx, acc)
 	if err != nil {
+		if r.State != nil && (r.State.SessionID != "" || len(r.State.Media) > 0) {
+			return nil, &NoRetry{Err: err}
+		}
 		return nil, err
 	}
 	defer e.release(acc.ID, a)
 	progress(10)
-	turnCtx, cancel := context.WithTimeout(ctx, r.Timeout)
-	defer cancel()
-	turn, err := e.runTurn(turnCtx, a, r.Prompt, r.Refs, r.Kind, "", nil, progress)
-	e.persist(acc.ID, a.protoAcct, nil)
-	if err != nil {
-		return nil, err
+	state := r.State
+	if state == nil {
+		state = &GenerationState{}
+	}
+	state.AccountID = acc.ID
+	var turn *turnResult
+	if len(state.Media) > 0 {
+		turn = &turnResult{media: state.Media}
+	} else {
+		stage("generating")
+		if state.Deadline.IsZero() {
+			state.Deadline = time.Now().Add(r.Timeout)
+		}
+		turnCtx, cancel := context.WithDeadline(ctx, state.Deadline)
+		turn, err = e.runTurnResumable(turnCtx, a, r.Prompt, r.Refs, r.Kind, "", nil, progress, state, r.SaveState)
+		cancel()
+		e.persist(acc.ID, a.protoAcct, nil)
+		if err != nil {
+			return nil, &StageError{Stage: "generating", Err: err}
+		}
 	}
 	if len(turn.media) == 0 {
 		// A failed media tool call names the real cause; the assistant's
@@ -1518,11 +1577,18 @@ func (e *ProtoEngine) Generate(ctx context.Context, acc *Account, r GenRequest) 
 			return nil, err
 		}
 		if turn.text == "" {
-			return nil, &NoRetry{Err: errf(KindTransient, "等待生成超时，未出现新的%s", kindName(r.Kind))}
+			return nil, &NoRetry{Err: errf(KindTransient, "生成结束但未返回%s", kindName(r.Kind))}
 		}
 		return nil, wrap(KindRefusal, fmt.Sprintf("模型未生成%s，仅返回文本", kindName(r.Kind)), &ModelReply{Text: turn.text})
 	}
+	state.Media = turn.media
+	if r.SaveState != nil {
+		if err := r.SaveState(state); err != nil {
+			return nil, &NoRetry{Err: wrap(KindTransient, "保存媒体引用失败", err)}
+		}
+	}
 	progress(80)
+	stage("downloading")
 	list := turn.media
 	if len(list) > r.N {
 		list = list[len(list)-r.N:]
@@ -1531,7 +1597,7 @@ func (e *ProtoEngine) Generate(ctx context.Context, acc *Account, r GenRequest) 
 	defer dlCancel()
 	out, lastErr := e.fetchAll(dlCtx, a, list)
 	if len(out) == 0 {
-		return nil, &NoRetry{Err: wrap(KindTransient, "已生成但未能取回文件", lastErr)}
+		return nil, &StageError{Stage: "downloading", Err: &NoRetry{Err: wrap(KindTransient, "已生成但未能取回文件", lastErr)}}
 	}
 	progress(100)
 	return out, nil

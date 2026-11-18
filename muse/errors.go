@@ -51,6 +51,15 @@ func BadRequest(format string, a ...any) *Error { return errf(KindBadRequest, fo
 // The underlying error still determines account health and API status.
 type NoRetry struct{ Err error }
 
+// StageError identifies the failed phase without parsing translated messages.
+type StageError struct {
+	Stage string
+	Err   error
+}
+
+func (e *StageError) Error() string { return e.Err.Error() }
+func (e *StageError) Unwrap() error { return e.Err }
+
 func (e *NoRetry) Error() string { return e.Err.Error() }
 func (e *NoRetry) Unwrap() error { return e.Err }
 

@@ -27,7 +27,9 @@ func TestMediaTextOnlyCompletionRequiresTerminalAndQuiet(t *testing.T) {
 		{"recent stream or tool activity", "I cannot generate that video", true, false, false, false, 0, false},
 		{"completed tools and explicit refusal", "I cannot generate that video", true, false, false, false, time.Minute, true},
 		{"completed question", "Which scene should I use?", true, false, false, false, 3 * time.Minute, true},
-		{"completed video text-only reply settles without waiting", "这个版本不能按原样生成。", true, false, false, false, 3 * time.Second, true},
+		{"completed non-refusal waits for late tools", "这个版本不能按原样生成。", true, false, false, false, 3 * time.Second, false},
+		{"completed progress is not turn completion", "Generating video", true, false, false, false, 3 * time.Minute, false},
+		{"ordinary completed text receives grace", "Here is the result", true, false, false, false, 3 * time.Second, false},
 		{"explicit turn completion", "Generating video", true, false, false, true, time.Minute, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -35,6 +37,30 @@ func TestMediaTextOnlyCompletionRequiresTerminalAndQuiet(t *testing.T) {
 				t.Fatalf("settled=%v want=%v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestExhaustedToolFailureEndsWithoutAssistantText(t *testing.T) {
+	site, gw := fakemuse.NewWithGateway()
+	defer site.Close()
+	gw.HistoryResponse = func(string) ([]byte, bool) {
+		return []byte(`{"chat_events":[{"event_name":"message.user","message_id":"anchor","text":"create video"},{"event_name":"tool.call","payload":{"tool_call_id":"render","status":"running"}},{"event_name":"tool.result","payload":{"call_id":"render","output":"{\"status\":\"error\",\"error\":\"upstream_unavailable\",\"upstream_status\":502,\"retry_exhausted\":true}"}}]}`), true
+	}
+	e, account := newTestProto(t, site.URL, "ws"+strings.TrimPrefix(site.URL, "http")+"/v1/noise")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	lease, err := e.acquire(ctx, account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.release(account.ID, lease)
+	oldSettle, oldPoll := textSettle, pollInterval
+	textSettle, pollInterval = 5*time.Millisecond, 5*time.Millisecond
+	defer func() { textSettle, pollInterval = oldSettle, oldPoll }()
+	_, err = e.followThread(ctx, lease.conn, "failure", "anchor", "create video", "video", "", nil, nil, nil)
+	var exhausted *exhaustedToolError
+	if !errors.As(err, &exhausted) || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected explicit tool failure, got %v", err)
 	}
 }
 
@@ -133,7 +159,7 @@ func TestFollowMediaWaitsForToolThenCollectsLateVideo(t *testing.T) {
 			unknownAssistant := strings.HasPrefix(final, "unknown_")
 			emptyAssistant := strings.HasPrefix(final, "empty_assistant_")
 			wantVideo := final == "video" || final == "empty_assistant_video"
-			wantTimeout := final == "timeout" || unknownAssistant || final == "empty_assistant_timeout" || final == "empty_assistant_terminal"
+			wantTimeout := final == "timeout" || unknownAssistant || final == "empty_assistant_timeout"
 			site, gateway := fakemuse.NewWithGateway()
 			defer site.Close()
 			var polls atomic.Int32
@@ -159,11 +185,11 @@ func TestFollowMediaWaitsForToolThenCollectsLateVideo(t *testing.T) {
 					// preceding completed text must neither end this new reply
 					// nor survive in a later media result.
 					payload := map[string]any{"text": "", "metadata": map[string]any{"streaming": true}}
-					if final == "empty_assistant_terminal" {
+					if final == "empty_assistant_terminal" && n >= 6 {
 						payload = map[string]any{"text": "", "status": "completed"}
 					}
 					events[2] = map[string]any{"event_name": "message.assistant", "payload": payload}
-					if final == "empty_assistant_terminal" {
+					if final == "empty_assistant_terminal" && n >= 6 {
 						events = append(events, map[string]any{"event_name": "turn.completed"})
 					}
 				}

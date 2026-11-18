@@ -46,6 +46,12 @@ func NewGateway() *Gateway {
 	return &Gateway{threads: map[string][]map[string]any{}, Files: map[string][]byte{}}
 }
 
+func (g *Gateway) SubmittedTurns() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.nextMsg
+}
+
 // ---- server-side websocket (just enough for tests)
 
 type wsConn struct {

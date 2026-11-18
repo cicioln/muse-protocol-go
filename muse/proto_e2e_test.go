@@ -3,6 +3,8 @@ package muse
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -13,6 +15,55 @@ import (
 
 	"github.com/CoolkHz/muse-protocol-go/internal/fakemuse"
 )
+
+func TestGenerateResumesCheckpointWithoutSubmittingAgain(t *testing.T) {
+	for _, stopAt := range []string{"session", "media"} {
+		t.Run(stopAt, func(t *testing.T) {
+			site, gw := fakemuse.NewWithGateway()
+			defer site.Close()
+			cfg := Config{DataDir: t.TempDir(), SiteURL: site.URL, GatewayURL: "ws" + strings.TrimPrefix(site.URL, "http") + "/v1/noise"}
+			eng := NewClient(cfg)
+			defer eng.Close()
+			acc := &Account{ID: "resume", Cookies: map[string]string{"hatch_sess": "s1"}}
+			state := &GenerationState{}
+			var saved []byte
+			interrupted := errors.New("simulated process interruption")
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_, err := eng.Generate(ctx, acc, GenRequest{Prompt: "draw a cat", Kind: "image", State: state, SaveState: func(s *GenerationState) error {
+				saved, _ = json.Marshal(s)
+				if (stopAt == "session" && s.MessageID != "") || (stopAt == "media" && len(s.Media) > 0) {
+					return interrupted
+				}
+				return nil
+			}})
+			if !errors.Is(err, interrupted) {
+				t.Fatalf("checkpoint interruption: %v", err)
+			}
+			before := gw.SubmittedTurns()
+			eng.Close()
+			restarted := NewClient(cfg)
+			defer restarted.Close()
+			var restored GenerationState
+			if err := json.Unmarshal(saved, &restored); err != nil {
+				t.Fatal(err)
+			}
+			unavailable := NewClient(cfg)
+			_, reconnectErr := unavailable.Generate(ctx, &Account{ID: acc.ID, Cookies: map[string]string{"hatch_sess": "nope"}}, GenRequest{Prompt: "draw a cat", Kind: "image", State: &restored})
+			unavailable.Close()
+			if reconnectErr == nil || Retryable(reconnectErr) {
+				t.Fatalf("reconnection failure must not allow a fresh generation: %v", reconnectErr)
+			}
+			files, err := restarted.Generate(ctx, acc, GenRequest{Prompt: "draw a cat", Kind: "image", State: &restored})
+			if err != nil || len(files) != 1 {
+				t.Fatalf("resume: %v, files=%d", err, len(files))
+			}
+			if gw.SubmittedTurns() != before {
+				t.Fatal("checkpoint recovery submitted a second generation")
+			}
+		})
+	}
+}
 
 func TestProtoEngineAgainstFakeGateway(t *testing.T) {
 	site, gw := fakemuse.NewWithGateway()

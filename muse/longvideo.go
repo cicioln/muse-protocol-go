@@ -61,7 +61,19 @@ type LongVideoRequest struct {
 	Join string
 	// OnJoin, when set, reports where the segments were joined ("vm" or
 	// "local") and, after a fallback, why the VM join failed.
-	OnJoin func(where string, vmErr error)
+	OnJoin    func(where string, vmErr error)
+	State     *LongVideoState
+	SaveState func(*LongVideoState) error
+	OnStage   func(stage string, segment, segments int)
+	// JoinTimeout includes VM assembly, downloading and local fallback.
+	JoinTimeout time.Duration
+}
+
+type LongVideoState struct {
+	AccountID string          `json:"account_id,omitempty"`
+	Plan      []int           `json:"plan,omitempty"`
+	Segments  []Media         `json:"segments,omitempty"`
+	Current   GenerationState `json:"current"`
 }
 
 // SplitVideoSeconds splits total seconds into the fewest segments of at most
@@ -105,13 +117,25 @@ func (c Config) FFmpeg() (string, error) {
 // video of the expected length, local ffmpeg joins instead (with JoinAuto).
 // Local joins run at low priority, Config.FFmpegConcurrency at a time.
 // Segments longer than planned are cut to their planned length. The joined
-// video is saved in Config.MediaDir(); the segments are removed.
+// video is saved in Config.MediaDir(). With State, the caller removes the saved
+// segments after durably accepting the result; otherwise they are removed here.
 //
 // A failure after the first segment is wrapped in NoRetry, because earlier
 // segments already used the account's media quota.
 func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r LongVideoRequest) (*Media, error) {
 	if r.Segment == nil {
 		return nil, BadRequest("segment callback is required")
+	}
+	state := r.State
+	if state == nil {
+		state = &LongVideoState{}
+	}
+	if acc == nil || (state.AccountID != "" && state.AccountID != acc.ID) {
+		return nil, BadRequest("video checkpoint belongs to another account")
+	}
+	state.AccountID = acc.ID
+	if len(state.Plan) > 0 {
+		r.Plan = state.Plan
 	}
 	var plan []int
 	if len(r.Plan) > 0 {
@@ -148,12 +172,18 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 		}
 	}
 	dir := e.cfg.MediaDir()
-	var segments []Media
+	if len(state.Segments) > len(plan) {
+		return nil, BadRequest("invalid saved video segments")
+	}
+	state.Plan = plan
+	segments := append([]Media(nil), state.Segments...)
 	var lengths []float64
 	var temp []string
 	defer func() {
-		for _, m := range segments {
-			_ = os.Remove(filepath.Join(dir, m.Filename))
+		if r.State == nil {
+			for _, m := range segments {
+				_ = os.Remove(filepath.Join(dir, m.Filename))
+			}
 		}
 		for _, path := range temp {
 			_ = os.Remove(path)
@@ -162,6 +192,25 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 	var frame *RefImage
 	start := 0
 	for i, seconds := range plan {
+		if i < len(state.Segments) {
+			m := state.Segments[i]
+			length := float64(seconds)
+			if m.Seconds > 0 {
+				length = min(length, m.Seconds)
+			}
+			lengths = append(lengths, length)
+			start += seconds
+			if i == len(state.Segments)-1 && i < len(plan)-1 {
+				path := filepath.Join(dir, ".frame-"+randHex(8)+".png")
+				temp = append(temp, path)
+				data, err := lastFrame(ctx, ffmpeg, filepath.Join(dir, m.Filename), length, path)
+				if err != nil {
+					return nil, &NoRetry{Err: wrap(KindTransient, "恢复视频末帧失败", err)}
+				}
+				frame = &RefImage{Data: data, Mime: "image/png"}
+			}
+			continue
+		}
 		prompt, refs := r.Segment(VideoSegment{Index: i, Count: len(plan), Start: start, Seconds: seconds, LastFrame: frame})
 		var files []Media
 		for attempt := 0; attempt < 2; attempt++ {
@@ -174,6 +223,18 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 				Refs:    refs,
 				N:       1,
 				Timeout: r.Timeout,
+				State:   &state.Current,
+				SaveState: func(current *GenerationState) error {
+					if r.SaveState != nil {
+						return r.SaveState(state)
+					}
+					return nil
+				},
+				OnStage: func(stage string) {
+					if r.OnStage != nil {
+						r.OnStage(stage, i+1, len(plan))
+					}
+				},
 				OnProgress: func(p int) {
 					progress((i*100 + p) * 90 / (len(plan) * 100))
 				},
@@ -193,6 +254,13 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 		}
 		segment := files[0]
 		segments = append(segments, segment)
+		state.Segments = append(state.Segments, segment)
+		state.Current = GenerationState{}
+		if r.SaveState != nil {
+			if err := r.SaveState(state); err != nil {
+				return nil, &NoRetry{Err: wrap(KindTransient, "保存视频分段失败", err)}
+			}
+		}
 		length := float64(seconds)
 		if segment.Seconds > 0 && segment.Seconds < length {
 			length = segment.Seconds
@@ -211,16 +279,32 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 		frame = &RefImage{Data: data, Mime: "image/png"}
 	}
 	progress(92)
+	if r.OnStage != nil {
+		r.OnStage("joining", len(plan), len(plan))
+	}
 	if len(segments) == 1 && segments[0].Seconds <= float64(plan[0])+0.5 {
 		out := segments[0]
 		segments = nil
 		progress(100)
 		return &out, nil
 	}
-	job := newJoinJob(ctx, ffmpeg, dir, segments, lengths)
+	joinTimeout := r.JoinTimeout
+	if joinTimeout <= 0 {
+		joinTimeout = 16 * time.Minute
+	}
+	joinCtx, joinCancel := context.WithTimeout(ctx, joinTimeout)
+	defer joinCancel()
+	job := newJoinJob(joinCtx, ffmpeg, dir, segments, lengths)
 	var vmErr error
 	if r.Join != JoinLocal {
-		out, err := e.joinOnVM(ctx, acc, job)
+		deadline, _ := joinCtx.Deadline()
+		vmDeadline := deadline
+		if r.Join == JoinAuto {
+			vmDeadline = deadline.Add(-min(2*time.Minute, time.Until(deadline)/4))
+		}
+		vmCtx, vmCancel := context.WithDeadline(joinCtx, vmDeadline)
+		out, err := e.joinOnVM(vmCtx, acc, job)
+		vmCancel()
 		if err == nil {
 			if r.OnJoin != nil {
 				r.OnJoin("vm", nil)
@@ -228,8 +312,8 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 			progress(100)
 			return out, nil
 		}
-		if ctx.Err() != nil {
-			return nil, &NoRetry{Err: wrap(KindTransient, "拼接视频中断", ctx.Err())}
+		if joinCtx.Err() != nil {
+			return nil, &StageError{Stage: "joining", Err: &NoRetry{Err: wrap(KindTransient, "拼接视频中断", joinCtx.Err())}}
 		}
 		vmErr = err
 		if r.Join == JoinVM {
@@ -238,10 +322,10 @@ func (e *ProtoEngine) GenerateLongVideo(ctx context.Context, acc *Account, r Lon
 	}
 	select {
 	case e.ffmpegGate <- struct{}{}:
-	case <-ctx.Done():
-		return nil, &NoRetry{Err: wrap(KindTransient, "等待本地拼接中断", ctx.Err())}
+	case <-joinCtx.Done():
+		return nil, &StageError{Stage: "joining", Err: &NoRetry{Err: wrap(KindTransient, "等待本地拼接中断", joinCtx.Err())}}
 	}
-	out, err := joinLocally(ctx, ffmpeg, dir, job)
+	out, err := joinLocally(joinCtx, ffmpeg, dir, job)
 	<-e.ffmpegGate
 	if err != nil {
 		return nil, &NoRetry{Err: wrap(KindTransient, "拼接视频失败", err)}
@@ -257,17 +341,8 @@ func canRetrySegment(ctx context.Context, err error) bool {
 	if err == nil || ctx.Err() != nil {
 		return false
 	}
-	if Retryable(err) {
-		return KindOf(err) == KindTransient
-	}
-	if KindOf(err) != KindTransient {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	var exhausted *exhaustedToolError
-	return !errors.As(err, &exhausted)
+	return Retryable(err) && KindOf(err) == KindTransient &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
 }
 
 func segmentError(err error, index, count int) error {

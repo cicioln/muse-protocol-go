@@ -2,6 +2,7 @@ package muse
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -18,6 +19,46 @@ import (
 
 	"github.com/CoolkHz/muse-protocol-go/internal/fakemuse"
 )
+
+func TestLongVideoResumesCompletedSegments(t *testing.T) {
+	ffmpeg := requireFFmpeg(t)
+	video := clips(t, ffmpeg)
+	var generated atomic.Int32
+	eng, _, acc, _ := longVideoEngine(t, func(gw *fakemuse.Gateway) { gw.Video = func(n int) []byte { generated.Add(1); return video(n) } })
+	state := &LongVideoState{}
+	var checkpoint []byte
+	stop := errors.New("checkpoint interruption")
+	req := longVideoRequest(JoinLocal, nil)
+	req.State = state
+	req.SaveState = func(s *LongVideoState) error {
+		checkpoint, _ = json.Marshal(s)
+		if len(s.Segments) == 1 {
+			return stop
+		}
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := eng.GenerateLongVideo(ctx, acc, req); !errors.Is(err, stop) {
+		t.Fatalf("expected checkpoint interruption, got %v", err)
+	}
+	var restored LongVideoState
+	if err := json.Unmarshal(checkpoint, &restored); err != nil {
+		t.Fatal(err)
+	}
+	req.State, req.SaveState = &restored, nil
+	if _, err := eng.GenerateLongVideo(ctx, acc, req); err != nil {
+		t.Fatal(err)
+	}
+	// A crash before the host durably accepts the result must still recover
+	// from the completed segments without generating them again.
+	if _, err := eng.GenerateLongVideo(ctx, acc, req); err != nil {
+		t.Fatalf("resume after assembly: %v", err)
+	}
+	if generated.Load() != 2 {
+		t.Fatalf("regenerated completed segments: %d generations", generated.Load())
+	}
+}
 
 func TestSplitVideoSeconds(t *testing.T) {
 	cases := []struct {
@@ -433,8 +474,8 @@ func TestCanRetrySegment(t *testing.T) {
 	cancel()
 
 	hatchDrop := &NoRetry{Err: wrap(KindTransient, "hatch 连接中断", io.EOF)}
-	if !canRetrySegment(ctx, hatchDrop) {
-		t.Fatal("expected NoRetry hatch disconnect to be locally retryable by GenerateLongVideo")
+	if canRetrySegment(ctx, hatchDrop) {
+		t.Fatal("an uncertain delivery must resume its session, never regenerate the segment")
 	}
 	if canRetrySegment(canceled, hatchDrop) {
 		t.Fatal("must not retry segment once parent context is canceled")
