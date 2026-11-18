@@ -581,6 +581,12 @@ func (e *ProtoEngine) followThreadWithReconnect(ctx context.Context, conn *hatch
 			Path: "/chat/history?" + url.Values{"limit": {"60"}, "session_id": {sessionID}}.Encode()})
 		cancel()
 		if err != nil {
+			// A wedged or half-open WebSocket stays Alive() while every history
+			// poll times out; close it after two failures so the reconnect path
+			// dials a fresh connection instead of hanging for 11 timeouts.
+			if conn.Alive() && reconnect != nil && ctx.Err() == nil && consecutiveErr >= 1 {
+				_ = conn.Close()
+			}
 			if !conn.Alive() {
 				if reconnect == nil || ctx.Err() != nil {
 					return nil, wrap(KindTransient, "hatch 连接中断", err)
@@ -613,12 +619,13 @@ func (e *ProtoEngine) followThreadWithReconnect(ctx context.Context, conn *hatch
 				continue
 			}
 			if consecutiveErr++; consecutiveErr > 10 {
+				_ = conn.Close()
 				return nil, wrap(KindTransient, "读取对话历史失败", err)
 			}
 			_ = sleep(ctx, time.Second)
 			continue
 		}
-		if resp.Status >= 500 {
+		if resp.Status >= 500 || resp.Status == http.StatusNotFound {
 			if consecutiveErr++; consecutiveErr > 12 {
 				return nil, classifyHTTPError("/chat/history", resp.Status, string(resp.Body), resp.Headers)
 			}
@@ -1267,7 +1274,7 @@ func (e *ProtoEngine) download(ctx context.Context, lease *protoLease, m mediaRe
 	if m.Path != "" {
 		esc := (&url.URL{Path: m.Path}).EscapedPath()
 		for _, prefix := range []string{"/media/raw/", "/fs/raw/"} {
-			for dlAttempt := 0; dlAttempt < 2; dlAttempt++ {
+			for dlAttempt := 0; dlAttempt < 3; dlAttempt++ {
 				if err := reset(); err != nil {
 					return "", 0, err
 				}
@@ -1280,7 +1287,7 @@ func (e *ProtoEngine) download(ctx context.Context, lease *protoLease, m mediaRe
 					}
 					conn = reconn
 				}
-				cctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+				cctx, cancel := context.WithTimeout(ctx, 90*time.Second)
 				ct, n, err := copyGatewayFile(cctx, conn, prefix+esc, f)
 				cancel()
 				if err == nil && n > 0 {
@@ -1290,9 +1297,12 @@ func (e *ProtoEngine) download(ctx context.Context, lease *protoLease, m mediaRe
 					err = fmt.Errorf("%s -> empty body", prefix+m.Path)
 				}
 				lastErr = err
-				if conn.Alive() || ctx.Err() != nil {
+				if ctx.Err() != nil || strings.HasSuffix(err.Error(), "-> HTTP 404") {
 					break
 				}
+				// A stalled or congested WebSocket connection can crawl at a
+				// few KB/s; close it so the next attempt dials a fresh socket.
+				_ = conn.Close()
 			}
 		}
 	}
@@ -1339,7 +1349,9 @@ func copyGatewayFile(ctx context.Context, conn *hatch.Conn, path string, w io.Wr
 	defer st.Close()
 	var n int64
 	for {
-		b, err := st.NextChunk(ctx)
+		chunkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		b, err := st.NextChunk(chunkCtx)
+		cancel()
 		if code := st.Status(); code >= 300 {
 			return "", 0, fmt.Errorf("%s -> HTTP %d", path, code)
 		}
@@ -1489,9 +1501,9 @@ func (e *ProtoEngine) Generate(ctx context.Context, acc *Account, r GenRequest) 
 	}
 	defer e.release(acc.ID, a)
 	progress(10)
-	ctx, cancel := context.WithTimeout(ctx, r.Timeout)
+	turnCtx, cancel := context.WithTimeout(ctx, r.Timeout)
 	defer cancel()
-	turn, err := e.runTurn(ctx, a, r.Prompt, r.Refs, r.Kind, "", nil, progress)
+	turn, err := e.runTurn(turnCtx, a, r.Prompt, r.Refs, r.Kind, "", nil, progress)
 	e.persist(acc.ID, a.protoAcct, nil)
 	if err != nil {
 		return nil, err
@@ -1515,7 +1527,9 @@ func (e *ProtoEngine) Generate(ctx context.Context, acc *Account, r GenRequest) 
 	if len(list) > r.N {
 		list = list[len(list)-r.N:]
 	}
-	out, lastErr := e.fetchAll(ctx, a, list)
+	dlCtx, dlCancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer dlCancel()
+	out, lastErr := e.fetchAll(dlCtx, a, list)
 	if len(out) == 0 {
 		return nil, &NoRetry{Err: wrap(KindTransient, "已生成但未能取回文件", lastErr)}
 	}

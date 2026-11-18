@@ -425,9 +425,9 @@ func (e *ProtoEngine) joinOnVM(ctx context.Context, acc *Account, j *joinJob) (*
 		return nil, err
 	}
 	defer e.release(acc.ID, a)
-	ctx, cancel := context.WithTimeout(ctx, vmJoinTimeout)
+	turnCtx, cancel := context.WithTimeout(ctx, vmJoinTimeout)
 	defer cancel()
-	turn, err := e.runTurn(ctx, a, prompt, nil, "video", "allow", nil, nil)
+	turn, err := e.runTurn(turnCtx, a, prompt, nil, "video", "allow", nil, nil)
 	e.persist(acc.ID, a.protoAcct, nil)
 	if err != nil {
 		return nil, err
@@ -441,7 +441,9 @@ func (e *ProtoEngine) joinOnVM(ctx context.Context, acc *Account, j *joinJob) (*
 	if result == nil {
 		return nil, errf(KindTransient, "VM 没有返回拼接后的视频：%s", clip(turn.text, 200))
 	}
-	files, err := e.fetchAll(ctx, a, []mediaRef{*result})
+	dlCtx, dlCancel := context.WithTimeout(ctx, 4*time.Minute)
+	defer dlCancel()
+	files, err := e.fetchAll(dlCtx, a, []mediaRef{*result})
 	if len(files) == 0 {
 		return nil, wrap(KindTransient, "下载拼接后的视频失败", err)
 	}
