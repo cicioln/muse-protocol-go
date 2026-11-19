@@ -589,6 +589,8 @@ func (e *ProtoEngine) followThreadWithReconnect(ctx context.Context, conn *hatch
 		cur                             string
 		done, inProgress, turnCompleted bool
 		historyInProgress               bool
+		commentary                      bool
+		activity                        mediaActivityTracker
 	)
 	needle := strings.TrimSpace(prompt)
 	if len(needle) > 80 {
@@ -699,11 +701,18 @@ func (e *ProtoEngine) followThreadWithReconnect(ctx context.Context, conn *hatch
 			// window must be rechecked, never paired with the previous reply.
 			lastBody = resp.Body
 			after := events[userIdx+1:]
+			for i, ev := range after {
+				if eventName(ev) == "message.user" {
+					after = after[:i]
+					break
+				}
+			}
 			if act := fmt.Sprintf("%d|%s", len(after), eventsFingerprint(after)); act != activitySig {
 				activitySig, lastActivity = act, time.Now()
 			}
 			res.events = after
 			cur, done, inProgress, turnCompleted = "", false, false, false
+			commentary = false
 			historyInProgress = mediaHistoryInProgress(after)
 			for _, ev := range after {
 				switch eventName(ev) {
@@ -718,6 +727,7 @@ func (e *ProtoEngine) followThreadWithReconnect(ctx context.Context, conn *hatch
 						// instead of treating that answer as this turn's final text.
 						cur, turnCompleted = t, false
 						inProgress, done = mediaLifecycle(p)
+						commentary = assistantCommentary(p)
 					} else if t != "" {
 						cur = t
 						turnCompleted = false
@@ -738,6 +748,7 @@ func (e *ProtoEngine) followThreadWithReconnect(ctx context.Context, conn *hatch
 				}
 			}
 			if want != "" {
+				activity.observe(after, sessionID)
 				res.text = cur // Includes clearing text replaced by an empty assistant.
 				all := extractMedia(after)
 				res.media = filterMedia(all, want)
@@ -765,6 +776,9 @@ func (e *ProtoEngine) followThreadWithReconnect(ctx context.Context, conn *hatch
 				return res, nil
 			}
 		} else {
+			if len(res.media) == 0 {
+				activity.poll(ctx, conn)
+			}
 			quietSince := lastActivity
 			if sig != nil {
 				if lastStream := time.Unix(0, sig.last.Load()); lastStream.After(quietSince) {
@@ -774,15 +788,18 @@ func (e *ProtoEngine) followThreadWithReconnect(ctx context.Context, conn *hatch
 			// An exhausted tool result is authoritative even when the assistant
 			// never writes a final message. Do not mistake an intermediate tool
 			// failure for a final one while another tool is still running.
-			if len(res.media) == 0 && !historyInProgress && time.Since(quietSince) >= textSettle {
+			if len(res.media) == 0 && !historyInProgress && !activity.active && time.Since(quietSince) >= textSettle {
+				if activity.failure != nil {
+					return nil, activity.failure.error(want)
+				}
 				if failure := findToolFailure(res.events); failure != nil && failure.exhausted {
 					return nil, failure.error(want)
 				}
-				if turnCompleted && cur == "" && !inProgress {
+				if turnCompleted && cur == "" && !inProgress && !commentary {
 					return res, nil
 				}
 			}
-			if len(res.media) == 0 && mediaTextOnlySettled(cur, want, done, inProgress, historyInProgress, turnCompleted, time.Since(quietSince)) {
+			if len(res.media) == 0 && mediaTextOnlySettled(cur, want, done, inProgress || commentary, historyInProgress || activity.active, turnCompleted, time.Since(quietSince)) {
 				return res, nil
 			}
 			key := ""
@@ -860,7 +877,7 @@ func mediaHistoryInProgress(events []map[string]any) bool {
 			// A final root answer can close older tool activity even when
 			// history retains a stale pending entry and has no turn.completed.
 			// A completed progress message or a subagent reply cannot do so.
-			if completed && !inProgress && text != "" && (isRefusal(text) || classifyTurnErr(text) != nil || !isWorking(text)) &&
+			if completed && !inProgress && !assistantCommentary(p) && text != "" && (isRefusal(text) || classifyTurnErr(text) != nil || !isWorking(text)) &&
 				str(ev, "reply_to_message_id") == "" && str(p, "reply_to_message_id") == "" {
 				clear(active)
 			}
@@ -890,9 +907,9 @@ func mediaLifecycle(payload map[string]any) (active, completed bool) {
 	if streaming, _ := md["streaming"].(bool); streaming {
 		return true, false
 	}
-	state := str(payload, "status")
+	state := strings.ToLower(str(payload, "status"))
 	if state == "" {
-		state = str(payload, "state")
+		state = strings.ToLower(str(payload, "state"))
 	}
 	switch state {
 	case "pending", "queued", "running", "in_progress", "streaming":

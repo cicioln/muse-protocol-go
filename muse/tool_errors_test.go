@@ -2,8 +2,11 @@ package muse
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -158,5 +161,87 @@ func TestToolRecoveryClearsEarlierFailure(t *testing.T) {
 	}
 	if f := findToolFailure(events); f != nil {
 		t.Fatalf("stale failure survived recovery: %+v", f)
+	}
+}
+
+func TestVideoActivityFailureUsesCurrentExecution(t *testing.T) {
+	for _, mode := range []string{"quota", "detail_quota", "foreign_agent", "foreign_execution", "quoted_success", "running", "unknown", "recovered", "unavailable", "later_turn"} {
+		t.Run(mode, func(t *testing.T) {
+			site, gw := fakemuse.NewWithGateway()
+			defer site.Close()
+			gw.HistoryResponse = func(sid string) ([]byte, bool) {
+				events := []map[string]any{
+					{"event_name": "message.user", "message_id": "anchor", "text": "create video"},
+					{"event_name": "message.assistant", "parent_agent_id": "thread-agent", "payload": map[string]any{"session_id": sid, "status": "completed", "text": "The test scene is ready.", "metadata": map[string]any{"message_kind": "commentary", "public_commentary": true, "root_message_execution_id": "execution-current"}}},
+					{"event_name": "turn.completed"},
+				}
+				if mode == "later_turn" {
+					events = append(events, map[string]any{"event_name": "message.user", "message_id": "later"}, map[string]any{"event_name": "tool.result", "payload": map[string]any{"status": "error", "kind": "video_daily_budget_exhausted"}})
+				}
+				b, _ := json.Marshal(map[string]any{"chat_events": events})
+				return b, true
+			}
+			var polls atomic.Int32
+			gw.ActivityResponse = func(path string) (int, []byte) {
+				n := polls.Add(1)
+				u, _ := url.Parse(path)
+				if mode == "unavailable" {
+					return 503, nil
+				}
+				agent, execution, status := "thread-agent", "execution-current", "FAILED"
+				if mode == "foreign_agent" {
+					agent = "another-agent"
+				}
+				if mode == "foreign_execution" || mode == "later_turn" {
+					execution = "another-execution"
+				}
+				if mode == "quoted_success" || mode == "recovered" && n > 1 {
+					status = "SUCCESS"
+				}
+				if mode == "detail_quota" && n == 1 {
+					status = "RUNNING"
+				}
+				actions := []any{map[string]any{"id": "ga-root-tool-" + execution + "-call_render", "kind": "tool_call", "status": status, "report": "Video tool result: kind: video_daily_budget_exhausted; downstream status: 429."}}
+				if mode == "running" || mode == "unknown" || mode == "recovered" && n == 1 {
+					state := "RUNNING"
+					if mode == "unknown" {
+						state = "NEW_STATE"
+					}
+					actions = append(actions, map[string]any{"id": "ga-root-tool-" + execution + "-call_other", "kind": "tool_call", "status": state})
+				}
+				activity := map[string]any{"message_id": "activity_thread:test", "status": "success", "details": map[string]any{"activity_thread_agent_id": agent, "goal_actions": actions}}
+				var result any = activity
+				if u.Path == "/activity" {
+					if u.Query().Get("capabilities") != "ACTIVITY_FEED_GOALS" {
+						return 400, nil
+					}
+					result = map[string]any{"days": []any{map[string]any{"activities": []any{activity}}}}
+				} else if u.Path != "/activity/activity_thread:test" {
+					return 404, nil
+				}
+				body, _ := json.Marshal(map[string]any{"ok": true, "result": result})
+				return 200, body
+			}
+			e, account := newTestProto(t, site.URL, "ws"+strings.TrimPrefix(site.URL, "http")+"/v1/noise")
+			oldSettle, oldPoll, oldActivity := textSettle, pollInterval, mediaActivityPollInterval
+			textSettle, pollInterval, mediaActivityPollInterval = 20*time.Millisecond, 5*time.Millisecond, 10*time.Millisecond
+			defer func() { textSettle, pollInterval, mediaActivityPollInterval = oldSettle, oldPoll, oldActivity }()
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			_, err := e.Generate(ctx, account, GenRequest{Prompt: "create video", Kind: "video", State: &GenerationState{SessionID: "test-session", MessageID: "anchor"}})
+			if mode == "quota" || mode == "detail_quota" {
+				if KindOf(err) != KindQuota || !Retryable(err) {
+					t.Fatalf("expected safe account failover, got %v", err)
+				}
+			} else if !errors.Is(err, context.DeadlineExceeded) || Retryable(err) {
+				t.Fatalf("unrelated or unfinished activity must await deadline without resubmission, got %v", err)
+			}
+			if polls.Load() == 0 || gw.SubmittedTurns() != 0 {
+				t.Fatalf("activity polls=%d submitted=%d", polls.Load(), gw.SubmittedTurns())
+			}
+			if mode == "detail_quota" && polls.Load() < 2 {
+				t.Fatal("did not refresh activity details")
+			}
+		})
 	}
 }

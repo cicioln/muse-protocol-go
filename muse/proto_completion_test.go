@@ -158,13 +158,14 @@ func TestEventsFingerprintTracksSameLengthTextAndToolProgress(t *testing.T) {
 }
 
 func TestFollowMediaWaitsForToolThenCollectsLateVideo(t *testing.T) {
-	for _, final := range []string{"video", "refusal", "timeout", "unknown_message.done", "unknown_delta.message_done", "empty_assistant_video", "empty_assistant_timeout", "empty_assistant_terminal", "acknowledgement_video", "acknowledgement_timeout"} {
+	for _, final := range []string{"video", "refusal", "timeout", "unknown_message.done", "unknown_delta.message_done", "empty_assistant_video", "empty_assistant_timeout", "empty_assistant_terminal", "acknowledgement_video", "acknowledgement_timeout", "commentary_video", "commentary_timeout"} {
 		t.Run(final, func(t *testing.T) {
 			unknownAssistant := strings.HasPrefix(final, "unknown_")
 			emptyAssistant := strings.HasPrefix(final, "empty_assistant_")
 			acknowledgement := strings.HasPrefix(final, "acknowledgement_")
-			wantVideo := final == "video" || final == "empty_assistant_video" || final == "acknowledgement_video"
-			wantTimeout := final == "timeout" || unknownAssistant || final == "empty_assistant_timeout" || final == "acknowledgement_timeout"
+			commentary := strings.HasPrefix(final, "commentary_")
+			wantVideo := final == "video" || final == "empty_assistant_video" || final == "acknowledgement_video" || final == "commentary_video"
+			wantTimeout := final == "timeout" || unknownAssistant || final == "empty_assistant_timeout" || final == "acknowledgement_timeout" || final == "commentary_timeout"
 			site, gateway := fakemuse.NewWithGateway()
 			defer site.Close()
 			var polls atomic.Int32
@@ -187,6 +188,11 @@ func TestFollowMediaWaitsForToolThenCollectsLateVideo(t *testing.T) {
 				}
 				if acknowledgement {
 					events[1]["payload"].(map[string]any)["text"] = "收到，我来按分镜制作测试视频。"
+					events[2] = map[string]any{"event_name": "turn.completed"}
+				}
+				if commentary {
+					events[1]["payload"].(map[string]any)["text"] = "The scene is ready."
+					events[1]["payload"].(map[string]any)["metadata"] = map[string]any{"message_kind": "commentary", "public_commentary": true}
 					events[2] = map[string]any{"event_name": "turn.completed"}
 				}
 				if emptyAssistant {

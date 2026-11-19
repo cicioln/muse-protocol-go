@@ -26,8 +26,9 @@ type Gateway struct {
 	nextMsg   int
 	Decisions []string // approval decisions received
 	// Optional immutable test hook; configure before serving any requests.
-	HistoryResponse func(sessionID string) ([]byte, bool)
-	HistoryStatus   func(sessionID string) int
+	HistoryResponse  func(sessionID string) ([]byte, bool)
+	HistoryStatus    func(sessionID string) int
+	ActivityResponse func(path string) (int, []byte)
 	// Files are extra workspace files served from /media/raw/<path>, keyed
 	// by path without a leading slash. Guarded by mu.
 	Files map[string][]byte
@@ -230,6 +231,13 @@ func (s *session) route(svc hatch.Service, id int64, req *hatch.AppRequest) {
 			}
 		}
 		go g.simulate(body.SessionID, body.Message, refs)
+	case req.Verb == "GET" && (u.Path == "/activity" || strings.HasPrefix(u.Path, "/activity/")):
+		if g.ActivityResponse != nil {
+			status, body := g.ActivityResponse(req.Path)
+			s.reply(id, status, body, true)
+		} else {
+			s.reply(id, 404, nil, true)
+		}
 	case req.Verb == "GET" && u.Path == "/chat/history":
 		sid := u.Query().Get("session_id")
 		if g.HistoryStatus != nil {
