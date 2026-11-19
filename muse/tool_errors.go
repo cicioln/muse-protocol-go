@@ -46,10 +46,12 @@ func (f *toolFailure) error(kind string) error {
 
 	lower := strings.ToLower(code)
 	switch {
+	case strings.Contains(lower, "quota") || strings.Contains(lower, "credit") || strings.Contains(lower, "video_daily_budget_exhausted"):
+		return &rejectedToolError{Err: errf(KindQuota, "%s", msg)}
 	case f.upstream == 429 || strings.Contains(lower, "rate_limit"):
-		return errf(KindRateLimit, "%s", msg)
-	case quotaRe.MatchString(code) || strings.Contains(lower, "quota") || strings.Contains(lower, "credit"):
-		return errf(KindQuota, "%s", msg)
+		return &rejectedToolError{Err: errf(KindRateLimit, "%s", msg)}
+	case quotaRe.MatchString(code):
+		return &rejectedToolError{Err: errf(KindQuota, "%s", msg)}
 	case f.upstream == 400 || f.upstream == 422 || containsAny(lower, policyCodes):
 		return errf(KindBadRequest, "%s", msg)
 	}
@@ -145,14 +147,14 @@ func walkToolFailures(v any, depth int, report func(*toolFailure)) {
 }
 
 func toolFailureOf(m map[string]any) *toolFailure {
-	upstream := intField(m, "upstream_status", "upstreamStatus")
+	upstream := intField(m, "upstream_status", "upstreamStatus", "downstream_status", "downstreamStatus")
 	status := strings.ToLower(str(m, "status"))
 	failed := status == "error" || status == "failed" || status == "failure"
-	code := errorCode(m["error"])
+	code := firstString(m, "error_code", "errorCode", "code", "kind")
 	if code == "" {
-		code = firstString(m, "error_code", "errorCode", "code")
+		code = errorCode(m["error"])
 	}
-	if !(failed && code != "") && upstream < 400 {
+	if !(failed && code != "") && upstream < 400 && code != "video_daily_budget_exhausted" {
 		return nil
 	}
 	return &toolFailure{
@@ -160,7 +162,7 @@ func toolFailureOf(m map[string]any) *toolFailure {
 		scope:     clip(firstString(m, "failure_scope", "failureScope"), 40),
 		upstream:  upstream,
 		attempts:  intField(m, "attempts", "attempt_count"),
-		exhausted: m["retry_exhausted"] == true || m["retryExhausted"] == true,
+		exhausted: m["retry_exhausted"] == true || m["retryExhausted"] == true || code == "video_daily_budget_exhausted",
 	}
 }
 
@@ -169,7 +171,7 @@ func errorCode(v any) string {
 	case string:
 		return strings.TrimSpace(t)
 	case map[string]any:
-		if code := firstString(t, "code", "type"); code != "" {
+		if code := firstString(t, "code", "type", "kind"); code != "" {
 			return code
 		}
 		return firstString(t, "message")

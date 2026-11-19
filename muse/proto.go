@@ -405,7 +405,7 @@ func (e *ProtoEngine) runTurnResumable(ctx context.Context, a *protoLease, promp
 	if state != nil && state.SessionID != "" {
 		result, err := e.followThreadWithReconnect(ctx, conn, state.SessionID, state.MessageID, prompt, want, approval, onDelta, progress, nil, reconnect)
 		if err != nil {
-			return nil, &NoRetry{Err: err}
+			return nil, turnFailure(err)
 		}
 		return result, nil
 	}
@@ -482,7 +482,7 @@ func (e *ProtoEngine) runTurnResumable(ctx context.Context, a *protoLease, promp
 	}()
 	result, err := e.followThreadWithReconnect(ctx, conn, sessionID, messageID, prompt, want, approval, onDelta, progress, sig, reconnect)
 	if err != nil {
-		return nil, &NoRetry{Err: err}
+		return nil, turnFailure(err)
 	}
 	return result, nil
 }
@@ -1439,6 +1439,11 @@ func describeMedia(f io.ReaderAt, size int64, mime string, m mediaRef) *Media {
 // reply that starts like an upstream limit notice counts as one. The reply is
 // kept on the error as a *ModelReply.
 func classifyTurnErr(text string) error {
+	// Media replies may summarize this structured tool code in a longer
+	// failure report. Do not apply this exception to ordinary chat answers.
+	if strings.Contains(text, "video_daily_budget_exhausted") {
+		return &Error{Kind: KindQuota, Msg: "视频每日额度已用尽", Err: &ModelReply{Text: text}}
+	}
 	err := classifyChatNotice(text)
 	if err == nil {
 		return nil

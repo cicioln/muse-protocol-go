@@ -63,6 +63,21 @@ func (e *StageError) Unwrap() error { return e.Err }
 func (e *NoRetry) Error() string { return e.Err.Error() }
 func (e *NoRetry) Unwrap() error { return e.Err }
 
+// rejectedToolError is an explicit media-tool rejection before generation.
+// Unlike a lost polling response, it is safe to submit on another account.
+type rejectedToolError struct{ Err error }
+
+func (e *rejectedToolError) Error() string { return e.Err.Error() }
+func (e *rejectedToolError) Unwrap() error { return e.Err }
+
+func turnFailure(err error) error {
+	var rejected *rejectedToolError
+	if errors.As(err, &rejected) && Retryable(err) {
+		return err
+	}
+	return &NoRetry{Err: err}
+}
+
 // exhaustedToolError marks an upstream tool failure that already exhausted its
 // own retries, distinguishing it from transport/polling NoRetry errors so long
 // video segments do not blindly re-run hopeless tool calls.

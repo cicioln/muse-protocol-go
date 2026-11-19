@@ -20,7 +20,7 @@ func classifyHTTPError(path string, status int, body string, headers []hatch.Hea
 	case http.StatusTooManyRequests:
 		kind = KindRateLimit
 		lower := strings.ToLower(body)
-		for _, marker := range []string{"insufficient_quota", "out of credits", "credits exhausted", "额度不足", "积分不足"} {
+		for _, marker := range []string{"insufficient_quota", "out of credits", "credits exhausted", "video_daily_budget_exhausted", "额度不足", "积分不足"} {
 			if strings.Contains(lower, marker) {
 				kind = KindQuota
 				break
