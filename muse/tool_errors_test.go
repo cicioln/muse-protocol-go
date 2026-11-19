@@ -3,7 +3,6 @@ package muse
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -67,11 +66,14 @@ func TestToolFailureKinds(t *testing.T) {
 }
 
 func TestVideoDailyBudgetFailureCanSwitchAccounts(t *testing.T) {
-	for _, resume := range []bool{false, true} {
-		t.Run(fmt.Sprintf("resume=%v", resume), func(t *testing.T) {
+	for _, mode := range []string{"fresh", "resumed", "prose"} {
+		t.Run(mode, func(t *testing.T) {
 			site, gw := fakemuse.NewWithGateway()
 			defer site.Close()
 			gw.HistoryResponse = func(string) ([]byte, bool) {
+				if mode == "prose" {
+					return []byte(`{"chat_events":[{"event_name":"message.user","message_id":"anchor","text":"create video"},{"event_name":"message.assistant","payload":{"status":"completed","text":"测试视频未完成，今天的视频额度已经用完了。请明天重试。"}},{"event_name":"turn.completed"}]}`), true
+				}
 				return []byte(`{"chat_events":[{"event_name":"message.user","message_id":"anchor","text":"create video"},{"event_name":"tool.result","payload":{"call_id":"render","output":"{\"status\":\"error\",\"kind\":\"video_daily_budget_exhausted\",\"downstream_status\":429}"}}]}`), true
 			}
 			e, account := newTestProto(t, site.URL, "ws"+strings.TrimPrefix(site.URL, "http")+"/v1/noise")
@@ -79,7 +81,7 @@ func TestVideoDailyBudgetFailureCanSwitchAccounts(t *testing.T) {
 			textSettle, pollInterval = 5*time.Millisecond, 5*time.Millisecond
 			defer func() { textSettle, pollInterval = oldSettle, oldPoll }()
 			state := &GenerationState{}
-			if resume {
+			if mode == "resumed" {
 				state.SessionID, state.MessageID = "failure", "anchor"
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -114,6 +116,38 @@ func TestVideoDailyBudgetFailureCanSwitchAccounts(t *testing.T) {
 	}
 	if KindOf(classifyHTTPError("/chat/stream", 429, `{"kind":"video_daily_budget_exhausted"}`, nil)) != KindQuota {
 		t.Fatal("daily video budget HTTP rejection was classified as temporary throttling")
+	}
+}
+
+func TestVideoQuotaProseCanSwitchAccounts(t *testing.T) {
+	for _, text := range []string{
+		"测试视频未完成，今天的视频额度已经用完了。请明天重试。",
+		"今日视频生成次数已达上限，请明天再试。",
+		"当前账号的视频额度已耗尽。",
+		"Video generation failed. This account has reached its video limit for the last 24 hours. Please try again tomorrow.",
+	} {
+		err := classifyTurnErr(text)
+		if err == nil || KindOf(err) != KindQuota || !Retryable(err) {
+			t.Errorf("quota notice must permit another account: %q => %v", text, err)
+		}
+		var reply *ModelReply
+		if !errors.As(err, &reply) || reply.Text != text {
+			t.Errorf("quota notice must preserve the upstream reply: %v", err)
+		}
+		if err := classifyChatNotice(text); err != nil {
+			t.Errorf("media prose must not change chat classification: %v", err)
+		}
+	}
+	for _, text := range []string{
+		"如果今天的视频额度已经用完了，请明天重试。",
+		"今天的视频额度没有用完，我来继续生成。",
+		"这个视频的时长达到上限，最多只能生成 10 秒。",
+		"The video exceeds the duration limit for this model.",
+		"I cannot generate this due to content policy. Your video quota is still available.",
+	} {
+		if err := classifyTurnErr(text); err != nil {
+			t.Errorf("not an account quota rejection: %q => %v", text, err)
+		}
 	}
 }
 

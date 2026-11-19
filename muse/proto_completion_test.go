@@ -30,7 +30,10 @@ func TestMediaTextOnlyCompletionRequiresTerminalAndQuiet(t *testing.T) {
 		{"completed non-refusal waits for late tools", "这个版本不能按原样生成。", true, false, false, false, 3 * time.Second, false},
 		{"completed progress is not turn completion", "Generating video", true, false, false, false, 3 * time.Minute, false},
 		{"ordinary completed text receives grace", "Here is the result", true, false, false, false, 3 * time.Second, false},
-		{"explicit turn completion", "Generating video", true, false, false, true, time.Minute, true},
+		{"completed progress turn still awaits media", "Generating video", true, false, false, true, time.Minute, false},
+		{"video acknowledgement awaits media", "收到，我来按分镜制作测试视频。", true, false, false, true, time.Minute, false},
+		{"completed final question", "Which scene should I use?", true, false, false, true, time.Minute, true},
+		{"video quota is terminal", "测试视频未完成，今天的视频额度已经用完了。请明天重试。", true, false, false, false, time.Minute, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := mediaTextOnlySettled(tc.text, "video", tc.done, tc.assistantActive, tc.toolActive, tc.ended, tc.quiet); got != tc.want {
@@ -116,6 +119,7 @@ func TestMediaHistoryFinalAnswerClosesOnlyEarlierToolActivity(t *testing.T) {
 		{"final clarification", "Which scene should I use?", "completed", false, false, false},
 		{"new tool after final answer", "I cannot generate that video", "completed", false, true, true},
 		{"completed progress message", "Generating video", "completed", false, false, true},
+		{"video acknowledgement", "收到，我来按分镜制作测试视频。", "completed", false, false, true},
 		{"incomplete refusal", "I cannot generate that video", "in_progress", false, false, true},
 		{"unknown lifecycle", "I cannot generate that video", "new-state", false, false, true},
 		{"subagent refusal", "I cannot generate that video", "completed", true, false, true},
@@ -154,12 +158,13 @@ func TestEventsFingerprintTracksSameLengthTextAndToolProgress(t *testing.T) {
 }
 
 func TestFollowMediaWaitsForToolThenCollectsLateVideo(t *testing.T) {
-	for _, final := range []string{"video", "refusal", "timeout", "unknown_message.done", "unknown_delta.message_done", "empty_assistant_video", "empty_assistant_timeout", "empty_assistant_terminal"} {
+	for _, final := range []string{"video", "refusal", "timeout", "unknown_message.done", "unknown_delta.message_done", "empty_assistant_video", "empty_assistant_timeout", "empty_assistant_terminal", "acknowledgement_video", "acknowledgement_timeout"} {
 		t.Run(final, func(t *testing.T) {
 			unknownAssistant := strings.HasPrefix(final, "unknown_")
 			emptyAssistant := strings.HasPrefix(final, "empty_assistant_")
-			wantVideo := final == "video" || final == "empty_assistant_video"
-			wantTimeout := final == "timeout" || unknownAssistant || final == "empty_assistant_timeout"
+			acknowledgement := strings.HasPrefix(final, "acknowledgement_")
+			wantVideo := final == "video" || final == "empty_assistant_video" || final == "acknowledgement_video"
+			wantTimeout := final == "timeout" || unknownAssistant || final == "empty_assistant_timeout" || final == "acknowledgement_timeout"
 			site, gateway := fakemuse.NewWithGateway()
 			defer site.Close()
 			var polls atomic.Int32
@@ -179,6 +184,10 @@ func TestFollowMediaWaitsForToolThenCollectsLateVideo(t *testing.T) {
 					// promote this unknown state to done and return immediately.
 					delete(events[1]["payload"].(map[string]any), "status")
 					events[2] = map[string]any{"event_name": strings.TrimPrefix(final, "unknown_")}
+				}
+				if acknowledgement {
+					events[1]["payload"].(map[string]any)["text"] = "收到，我来按分镜制作测试视频。"
+					events[2] = map[string]any{"event_name": "turn.completed"}
 				}
 				if emptyAssistant {
 					// No tool event masks the empty assistant lifecycle. The

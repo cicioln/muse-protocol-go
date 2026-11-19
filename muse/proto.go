@@ -778,7 +778,7 @@ func (e *ProtoEngine) followThreadWithReconnect(ctx context.Context, conn *hatch
 				if failure := findToolFailure(res.events); failure != nil && failure.exhausted {
 					return nil, failure.error(want)
 				}
-				if turnCompleted {
+				if turnCompleted && cur == "" && !inProgress {
 					return res, nil
 				}
 			}
@@ -818,12 +818,17 @@ func mediaTextOnlySettled(text, want string, done, assistantActive, historyActiv
 	if text == "" || !done || assistantActive || historyActive || quietFor < textSettle {
 		return false
 	}
-	if turnCompleted || isRefusal(text) {
+	if isRefusal(text) || classifyTurnErr(text) != nil {
 		return true
+	}
+	// An assistant turn can finish after acknowledging delegated media work.
+	// Its completion does not mean the video tool has produced a result.
+	if isWorking(text) {
+		return false
 	}
 	// A completed question/non-progress answer gets a grace period for tool
 	// events or presentations to arrive; any history or stream update resets it.
-	return !isWorking(text) && quietFor > textOnlyGrace(want)
+	return turnCompleted || quietFor > textOnlyGrace(want)
 }
 
 // textOnlyGrace is how long a finished, non-progress reply must stay quiet
@@ -855,7 +860,7 @@ func mediaHistoryInProgress(events []map[string]any) bool {
 			// A final root answer can close older tool activity even when
 			// history retains a stale pending entry and has no turn.completed.
 			// A completed progress message or a subagent reply cannot do so.
-			if completed && !inProgress && text != "" && (isRefusal(text) || !isWorking(text)) &&
+			if completed && !inProgress && text != "" && (isRefusal(text) || classifyTurnErr(text) != nil || !isWorking(text)) &&
 				str(ev, "reply_to_message_id") == "" && str(p, "reply_to_message_id") == "" {
 				clear(active)
 			}
@@ -919,7 +924,7 @@ var (
 	refusalMarkersRe = regexp.MustCompile(`(?i)(could ?n.?t|can.?t|cannot|unable to|not able to|won.?t|will not|fail(ed)? to)\s+(generate|create|make|depict|fulfill)|content policy|safety (policy|guidelines)|community (standards|guidelines)|real (people|individuals)|not available (for your account|in your)|country or region|out of credits|limit reached|tool is (currently )?unavailable|无法生成|生成失败|没生成成|未生成成功|不支持`)
 	// Progress and acknowledgement replies ("Got it — animating the cat")
 	// precede the media; they are not the final answer.
-	workingRe = regexp.MustCompile(`(?i)search|looking|checking|finding|generating|creating|drawing|rendering|animating|producing|preparing|processing|composing|wait|working on|got it|on it|one moment|just a (moment|sec)|hang tight|coming (right )?up|正在|生成中|制作中|处理中|稍等|请稍候|马上|这就`)
+	workingRe = regexp.MustCompile(`(?i)search|looking|checking|finding|generating|creating|drawing|rendering|animating|producing|preparing|processing|composing|wait|working on|got it|on it|one moment|just a (moment|sec)|hang tight|coming (right )?up|let me|i('ll| will)|正在|生成中|制作中|处理中|稍等|请稍候|马上|这就|收到|我来|我会|我将`)
 )
 
 func assistantFinished(p map[string]any) bool {
@@ -1441,7 +1446,7 @@ func describeMedia(f io.ReaderAt, size int64, mime string, m mediaRef) *Media {
 func classifyTurnErr(text string) error {
 	// Media replies may summarize this structured tool code in a longer
 	// failure report. Do not apply this exception to ordinary chat answers.
-	if strings.Contains(text, "video_daily_budget_exhausted") {
+	if strings.Contains(text, "video_daily_budget_exhausted") || mediaQuotaNoticeRe.MatchString(text) {
 		return &Error{Kind: KindQuota, Msg: "视频每日额度已用尽", Err: &ModelReply{Text: text}}
 	}
 	err := classifyChatNotice(text)
@@ -1463,8 +1468,12 @@ func (r *ModelReply) Error() string { return r.Text }
 // answer ("what is an API rate limit?") must not turn it into an error. Only
 // a brief reply that starts like an upstream limit notice is classified.
 var (
-	chatRateNoticeRe  = regexp.MustCompile(`(?i)^[\s\p{P}\p{S}]*(you('ve| have| are)? (been )?(rate[- ]limited|sending (requests )?too (fast|quickly))|too many requests|rate limit(ed)? (exceeded|reached|hit)|请求过于频繁|触发频率限制)`)
-	chatQuotaNoticeRe = regexp.MustCompile(`(?i)^[\s\p{P}\p{S}]*(you('ve| have)? (run out of|used up|used all( of)? your|reached your|hit your) (credits|usage|messages|daily|weekly|monthly|limit)|out of credits|(daily |weekly |monthly )?usage limit reached|(daily |weekly |monthly )?limit reached|额度不足|积分不足|用量已达|今日额度)`)
+	// Media agents often report a daily/account video quota rejection in a
+	// longer answer. Require an affirmative account quota clause at a sentence
+	// boundary, not conditional advice, content limits, or prompt duration.
+	mediaQuotaNoticeRe = regexp.MustCompile(`(?i)(?:^|[。！？.!?\n，,:：;；])\s*(?:(?:(?:今天|今日|当天|每日|本日)(?:的)?|(?:当前|这个|该|本|你的)?(?:账号|账户)(?:的)?)(?:视频|影片)(?:生成)?(?:额度|配额|预算|次数)(?:已经全部|已全部|已经|已|都|全部)?(?:用完|用尽|耗尽|不足|达到上限|达上限)|(?:this|your|the|current) account (?:has )?(?:reached|hit|exhausted) (?:its |the |your )?(?:daily |24[- ]hour )?video (?:limit|quota|budget))`)
+	chatRateNoticeRe   = regexp.MustCompile(`(?i)^[\s\p{P}\p{S}]*(you('ve| have| are)? (been )?(rate[- ]limited|sending (requests )?too (fast|quickly))|too many requests|rate limit(ed)? (exceeded|reached|hit)|请求过于频繁|触发频率限制)`)
+	chatQuotaNoticeRe  = regexp.MustCompile(`(?i)^[\s\p{P}\p{S}]*(you('ve| have)? (run out of|used up|used all( of)? your|reached your|hit your) (credits|usage|messages|daily|weekly|monthly|limit)|out of credits|(daily |weekly |monthly )?usage limit reached|(daily |weekly |monthly )?limit reached|额度不足|积分不足|用量已达|今日额度)`)
 )
 
 const chatNoticeMaxRunes = 200
