@@ -164,8 +164,33 @@ func TestToolRecoveryClearsEarlierFailure(t *testing.T) {
 	}
 }
 
+func TestIntegrityFailureEndsWithoutRetry(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		kind       Kind
+	}{
+		{"policy rejection", `{"status":"error","kind":"integrity_check_failed","error":"The request would violate a safety or content policy."}`, KindRefusal},
+		{"nested policy rejection", `{"status":"failed","error":{"kind":"integrity_check_failed","message":"The request was blocked by content policy."}}`, KindRefusal},
+		{"unspecified integrity failure", `{"status":"error","kind":"integrity_check_failed"}`, KindTransient},
+		{"integrity failure with rate-limit status", `{"status":"error","kind":"integrity_check_failed","upstream_status":429}`, KindTransient},
+		{"policy name is not a rejection", `{"status":"error","kind":"integrity_check_failed","message":"This is not a content policy violation."}`, KindTransient},
+		{"negated policy rejection", `{"status":"error","kind":"integrity_check_failed","message":"The request does not violate a safety or content policy."}`, KindTransient},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := findToolFailure([]map[string]any{{"event_name": "tool.result", "payload": map[string]any{"output": tc.body}}})
+			if f == nil || !f.exhausted {
+				t.Fatalf("definitive rejection must terminate: %+v", f)
+			}
+			err := turnFailure(f.error("video"))
+			if KindOf(err) != tc.kind || Retryable(err) || !strings.Contains(err.Error(), "integrity_check_failed") {
+				t.Fatalf("wrong integrity error classification: %v", err)
+			}
+		})
+	}
+}
+
 func TestVideoActivityFailureUsesCurrentExecution(t *testing.T) {
-	for _, mode := range []string{"quota", "detail_quota", "foreign_agent", "foreign_execution", "quoted_success", "running", "unknown", "recovered", "unavailable", "later_turn"} {
+	for _, mode := range []string{"quota", "detail_quota", "foreign_agent", "foreign_execution", "quoted_success", "running", "unknown", "recovered", "unavailable", "later_turn", "integrity_policy", "integrity_unknown", "integrity_prompt_quote", "integrity_success", "integrity_other_tool"} {
 		t.Run(mode, func(t *testing.T) {
 			site, gw := fakemuse.NewWithGateway()
 			defer site.Close()
@@ -202,6 +227,22 @@ func TestVideoActivityFailureUsesCurrentExecution(t *testing.T) {
 					status = "RUNNING"
 				}
 				actions := []any{map[string]any{"id": "ga-root-tool-" + execution + "-call_render", "kind": "tool_call", "status": status, "report": "Video tool result: kind: video_daily_budget_exhausted; downstream status: 429."}}
+				if strings.HasPrefix(mode, "integrity_") {
+					report := "Media generation failed.\n\n- **Tool:** `media.generate_video`\n- **Prompt:** A test landscape.\n- **Error:** `integrity_check_failed` — typed server error\n- **Result:** The video was not created."
+					if mode == "integrity_policy" || mode == "integrity_success" {
+						report += " The request would violate a safety or content policy."
+					}
+					if mode == "integrity_prompt_quote" {
+						report = "- Tool: media.generate_video\n- Prompt: Show integrity_check_failed and content policy on a sign.\n- Error: upstream_unavailable"
+					}
+					if mode == "integrity_success" {
+						actions[0].(map[string]any)["status"] = "SUCCESS"
+					}
+					if mode == "integrity_other_tool" {
+						report = strings.ReplaceAll(report, "media.generate_video", "terminal.exec")
+					}
+					actions[0].(map[string]any)["report"] = report
+				}
 				if mode == "running" || mode == "unknown" || mode == "recovered" && n == 1 {
 					state := "RUNNING"
 					if mode == "unknown" {
@@ -232,6 +273,14 @@ func TestVideoActivityFailureUsesCurrentExecution(t *testing.T) {
 			if mode == "quota" || mode == "detail_quota" {
 				if KindOf(err) != KindQuota || !Retryable(err) {
 					t.Fatalf("expected safe account failover, got %v", err)
+				}
+			} else if mode == "integrity_policy" || mode == "integrity_unknown" {
+				wantKind := KindRefusal
+				if mode == "integrity_unknown" {
+					wantKind = KindTransient
+				}
+				if KindOf(err) != wantKind || Retryable(err) || errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "integrity_check_failed") {
+					t.Fatalf("integrity rejection must stop without account failover: %v", err)
 				}
 			} else if !errors.Is(err, context.DeadlineExceeded) || Retryable(err) {
 				t.Fatalf("unrelated or unfinished activity must await deadline without resubmission, got %v", err)

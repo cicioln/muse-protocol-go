@@ -120,7 +120,41 @@ type mediaActivity struct {
 	} `json:"details"`
 }
 
-var videoBudgetCodeRe = regexp.MustCompile(`\bvideo_daily_budget_exhausted\b`)
+var (
+	videoBudgetCodeRe     = regexp.MustCompile(`\bvideo_daily_budget_exhausted\b`)
+	activityReportFieldRe = regexp.MustCompile(`(?im)^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?([a-z][a-z _-]*)(?:\*\*)?[ \t]*:(?:\*\*)?[ \t]*`)
+	integrityErrorCodeRe  = regexp.MustCompile("^[`*\"' \\t]*integrity_check_failed\\b")
+)
+
+func mediaActivityFailure(report string) *toolFailure {
+	// The report includes the original prompt. Read the labeled tool/error/result
+	// fields so a quoted error or policy name in that prompt is not authoritative.
+	var tool, detail string
+	integrity := false
+	fields := activityReportFieldRe.FindAllStringSubmatchIndex(report, -1)
+	for i, field := range fields {
+		end := len(report)
+		if i+1 < len(fields) {
+			end = fields[i+1][0]
+		}
+		value := strings.TrimSpace(report[field[1]:end])
+		switch strings.ToLower(strings.TrimSpace(report[field[2]:field[3]])) {
+		case "tool":
+			tool = strings.Trim(value, "`* \t\r\n")
+		case "error", "error kind", "error code", "kind", "code":
+			integrity = integrity || integrityErrorCodeRe.MatchString(value)
+		case "result", "reason":
+			detail += " " + value
+		}
+	}
+	if tool == "media.generate_video" && integrity {
+		return &toolFailure{code: "integrity_check_failed", exhausted: true, refusal: mediaPolicyRe.MatchString(detail)}
+	}
+	if videoBudgetCodeRe.MatchString(report) {
+		return &toolFailure{code: "video_daily_budget_exhausted", exhausted: true}
+	}
+	return nil
+}
 
 func (s *mediaActivityTracker) accept(activity mediaActivity) bool {
 	if activity.Details.AgentID != s.agentID {
@@ -139,8 +173,10 @@ func (s *mediaActivityTracker) accept(activity mediaActivity) bool {
 			// Reports are Markdown, not JSON. Only the explicit media rejection
 			// code is authoritative; prose and successful tool reports may quote
 			// unrelated errors or contain the input prompt.
-			if videoBudgetCodeRe.MatchString(action.Report) {
-				failure = &toolFailure{code: "video_daily_budget_exhausted", exhausted: true}
+			if f := mediaActivityFailure(action.Report); f != nil {
+				if failure == nil || !failure.refusal {
+					failure = f
+				}
 			}
 		case "success", "cancelled", "canceled":
 		default:

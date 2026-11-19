@@ -3,6 +3,7 @@ package muse
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -18,9 +19,13 @@ type toolFailure struct {
 	upstream  int
 	attempts  int
 	exhausted bool
+	refusal   bool
 }
 
 var policyCodes = []string{"policy", "safety", "moderation", "blocked", "rejected", "refus"}
+
+// Require an affirmative rejection, not a quoted policy name in an input.
+var mediaPolicyRe = regexp.MustCompile(`(?i)(?:would violate|will violate|(?:request|prompt|content) violates)\s+(?:(?:a|the|our)\s+)?(?:safety(?:\s+or\s+content)?|content)\s+polic(?:y|ies)|(?:request|prompt|content)\s+(?:was|is|has been)\s+(?:blocked|rejected)\s+(?:by|due to)\s+(?:the\s+)?(?:content|safety)\s+policy|(?:请求|内容|提示词)(?:已|会)?(?:违反|触犯)(?:了)?(?:内容|安全)(?:政策|策略)|未通过(?:内容|安全)审核`)
 
 // error turns the failure into an SDK error whose message carries the
 // tool's error code and upstream status.
@@ -46,6 +51,12 @@ func (f *toolFailure) error(kind string) error {
 
 	lower := strings.ToLower(code)
 	switch {
+	case f.refusal:
+		return errf(KindRefusal, "%s", msg)
+	case lower == "integrity_check_failed":
+		// This is a definite tool rejection, not a temporary rate limit. The
+		// code alone does not establish whether content policy was the cause.
+		return &NoRetry{Err: &exhaustedToolError{Err: errf(KindTransient, "%s", msg)}}
 	case strings.Contains(lower, "quota") || strings.Contains(lower, "credit") || strings.Contains(lower, "video_daily_budget_exhausted"):
 		return &rejectedToolError{Err: errf(KindQuota, "%s", msg)}
 	case f.upstream == 429 || strings.Contains(lower, "rate_limit"):
@@ -157,12 +168,19 @@ func toolFailureOf(m map[string]any) *toolFailure {
 	if !(failed && code != "") && upstream < 400 && code != "video_daily_budget_exhausted" {
 		return nil
 	}
+	detail := firstString(m, "message", "reason")
+	if e, ok := m["error"].(map[string]any); ok {
+		detail += " " + firstString(e, "message", "reason")
+	} else if message, ok := m["error"].(string); ok {
+		detail += " " + message
+	}
 	return &toolFailure{
 		code:      clip(code, 120),
 		scope:     clip(firstString(m, "failure_scope", "failureScope"), 40),
 		upstream:  upstream,
 		attempts:  intField(m, "attempts", "attempt_count"),
-		exhausted: m["retry_exhausted"] == true || m["retryExhausted"] == true || code == "video_daily_budget_exhausted",
+		exhausted: m["retry_exhausted"] == true || m["retryExhausted"] == true || code == "video_daily_budget_exhausted" || code == "integrity_check_failed",
+		refusal:   code == "integrity_check_failed" && mediaPolicyRe.MatchString(detail),
 	}
 }
 
