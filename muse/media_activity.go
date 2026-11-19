@@ -121,9 +121,10 @@ type mediaActivity struct {
 }
 
 var (
-	videoBudgetCodeRe     = regexp.MustCompile(`\bvideo_daily_budget_exhausted\b`)
-	activityReportFieldRe = regexp.MustCompile(`(?im)^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?([a-z][a-z _-]*)(?:\*\*)?[ \t]*:(?:\*\*)?[ \t]*`)
-	integrityErrorCodeRe  = regexp.MustCompile("^[`*\"' \\t]*integrity_check_failed\\b")
+	videoBudgetCodeRe       = regexp.MustCompile(`\bvideo_daily_budget_exhausted\b`)
+	activityReportFieldRe   = regexp.MustCompile(`(?im)^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?([a-z][a-z _-]*)(?:\*\*)?[ \t]*:(?:\*\*)?[ \t]*`)
+	integrityErrorCodeRe    = regexp.MustCompile("^[`*\"' \\t]*integrity_check_failed\\b")
+	mediaIntegritySummaryRe = regexp.MustCompile("(?m)^The `media\\.generate_video` tool failed with `integrity_check_failed`(?:[ .(]|$)")
 )
 
 func mediaActivityFailure(report string) *toolFailure {
@@ -132,6 +133,15 @@ func mediaActivityFailure(report string) *toolFailure {
 	var tool, detail string
 	integrity := false
 	fields := activityReportFieldRe.FindAllStringSubmatchIndex(report, -1)
+	summary := report
+	if len(fields) > 0 {
+		summary = report[:fields[0][0]]
+	}
+	// Muse also emits a prose summary ahead of the labeled sections. Restrict
+	// this fallback to that preamble so quoted text inside Prompt is excluded.
+	if mediaIntegritySummaryRe.MatchString(strings.TrimSpace(summary)) {
+		tool, integrity = "media.generate_video", true
+	}
 	for i, field := range fields {
 		end := len(report)
 		if i+1 < len(fields) {
@@ -143,7 +153,7 @@ func mediaActivityFailure(report string) *toolFailure {
 			tool = strings.Trim(value, "`* \t\r\n")
 		case "error", "error kind", "error code", "kind", "code":
 			integrity = integrity || integrityErrorCodeRe.MatchString(value)
-		case "result", "reason":
+		case "result", "reason", "error detail":
 			detail += " " + value
 		}
 	}

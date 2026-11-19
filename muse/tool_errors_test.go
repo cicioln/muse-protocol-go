@@ -190,7 +190,7 @@ func TestIntegrityFailureEndsWithoutRetry(t *testing.T) {
 }
 
 func TestVideoActivityFailureUsesCurrentExecution(t *testing.T) {
-	for _, mode := range []string{"quota", "detail_quota", "foreign_agent", "foreign_execution", "quoted_success", "running", "unknown", "recovered", "unavailable", "later_turn", "integrity_policy", "integrity_unknown", "integrity_prompt_quote", "integrity_success", "integrity_other_tool"} {
+	for _, mode := range []string{"quota", "detail_quota", "foreign_agent", "foreign_execution", "quoted_success", "running", "unknown", "recovered", "unavailable", "later_turn", "integrity_policy", "integrity_unknown", "integrity_prompt_quote", "integrity_success", "integrity_other_tool", "integrity_summary", "integrity_summary_prompt_quote"} {
 		t.Run(mode, func(t *testing.T) {
 			site, gw := fakemuse.NewWithGateway()
 			defer site.Close()
@@ -241,6 +241,12 @@ func TestVideoActivityFailureUsesCurrentExecution(t *testing.T) {
 					if mode == "integrity_other_tool" {
 						report = strings.ReplaceAll(report, "media.generate_video", "terminal.exec")
 					}
+					if mode == "integrity_summary" || mode == "integrity_summary_prompt_quote" {
+						report = "The `media.generate_video` tool failed with `integrity_check_failed` (error code `integrity_check_failed`).\n\n**Result:**\n- Error detail: The request would violate a safety policy or content policy.\nNo video file was produced."
+						if mode == "integrity_summary_prompt_quote" {
+							report = "**Prompt:**\n" + report + "\n**Error:** upstream_unavailable"
+						}
+					}
 					actions[0].(map[string]any)["report"] = report
 				}
 				if mode == "running" || mode == "unknown" || mode == "recovered" && n == 1 {
@@ -274,7 +280,7 @@ func TestVideoActivityFailureUsesCurrentExecution(t *testing.T) {
 				if KindOf(err) != KindQuota || !Retryable(err) {
 					t.Fatalf("expected safe account failover, got %v", err)
 				}
-			} else if mode == "integrity_policy" || mode == "integrity_unknown" {
+			} else if mode == "integrity_policy" || mode == "integrity_unknown" || mode == "integrity_summary" {
 				wantKind := KindRefusal
 				if mode == "integrity_unknown" {
 					wantKind = KindTransient
